@@ -41,3 +41,5 @@ Pick the structure matching what the PR is; for mixed PRs, lead with the dominan
 **Config, docs, chores** — no code example. A short overview of what changed and why is usually enough; add Key decisions only if a choice was non-obvious.
 
 Only include sections that carry signal. Skip Tests/Docs sections unless a reviewer needs specific guidance about them — the diff already shows the tests.
+
+When not specified, default to opening PRs in "draft" rather than ready to review.
