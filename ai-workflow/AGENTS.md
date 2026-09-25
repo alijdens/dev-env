@@ -29,6 +29,14 @@ If a task can't be fulfilled because something looks like an error, stop — don
 
 When asked to commit or create a PR, read `{{AI_WORKFLOW_DOCS_DIR}}/pull-requests.md` first and follow it. Don't load it otherwise.
 
+## Testing
+
+When writing or planning tests, read `{{AI_WORKFLOW_DOCS_DIR}}/testing.md` first and follow it. Don't load it otherwise.
+
+## Documentation and comments
+
+When writing code comments, docstrings, or docs, read `{{AI_WORKFLOW_DOCS_DIR}}/documentation.md` first and follow it. Don't load it otherwise.
+
 ## Implementation plans
 
 When asked to produce an implementation plan, read `{{AI_WORKFLOW_DOCS_DIR}}/planning.md` first and follow it. Don't load it otherwise.
