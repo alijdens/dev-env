@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Syncs a PR description from GitHub into /tmp/prs/<PR id>.description.md and reports whether
+# it changed, so callers only re-read the file when needed. Runs in the current repo (or pass
+# `-R owner/repo` after the PR id).
+#
+# Usage: pull-pr-description <PR id> [gh pr view flags...]
+#
+# Prints `path: <file>` and `status: <status>`:
+#   new        no local copy existed; it was created
+#   unchanged  nothing to re-read: GitHub matches the last pulled version (local file untouched, may
+#              hold unpushed edits) or matches the local file (e.g. right after pushing it)
+#   updated    GitHub changed since the last pull and the local file had no edits; it was replaced
+#   conflict   GitHub changed and the local file has unpushed edits; nothing was overwritten
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <PR id> [gh pr view flags...]" >&2
+  exit 1
+fi
+
+pr="$1"
+shift
+
+dir=/tmp/prs
+file="$dir/$pr.description.md"
+base="$dir/$pr.description.remote.md" # last version seen on GitHub, to tell local edits from remote changes
+fetched="$(mktemp)"
+trap 'rm -f "$fetched"' EXIT
+
+mkdir -p "$dir"
+gh pr view "$pr" "$@" --json body --jq .body > "$fetched"
+
+if [[ ! -f "$file" || ! -f "$base" ]]; then
+  status=new
+  cp "$fetched" "$file"
+  cp "$fetched" "$base"
+elif cmp -s "$fetched" "$file"; then
+  status=unchanged
+  cp "$fetched" "$base"
+elif cmp -s "$fetched" "$base"; then
+  status=unchanged
+elif cmp -s "$file" "$base"; then
+  status=updated
+  cp "$fetched" "$file"
+  cp "$fetched" "$base"
+else
+  status=conflict
+fi
+
+echo "path: $file"
+echo "status: $status"

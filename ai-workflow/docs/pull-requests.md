@@ -71,4 +71,14 @@ For a small fix, these can collapse into a short paragraph each, or fewer if the
 
 Skip Tests/Docs sections and test-plan checklists unless a reviewer needs specific guidance about them — the diff already shows the tests.
 
+### Updating an existing description
+
+Edit a local copy of the description instead of rewriting it inline, and make sure GitHub's version didn't change in the meantime:
+
+1. Run `pull-pr-description <PR id>` (on `PATH`; pass `-R owner/repo` after the id when outside the PR's repo). It syncs the description into `/tmp/prs/<PR id>.description.md` and prints `path:` and `status:`.
+2. Read the file only when `status` is `new` or `updated`. On `unchanged` your earlier read is still current; on `conflict` GitHub changed while the local file has unpushed edits: read GitHub's version (`gh pr view <PR id> --json body --jq .body`) and merge its changes into the local file, keeping both sides' intent. Ask the user only if the two sides contradict each other.
+3. Edit the file.
+4. Re-run the script right before pushing; on `conflict`, handle it as in step 2 (it keeps reporting `conflict` until the merged file is pushed, so don't re-check after merging). Push with `gh pr edit <PR id> --body-file /tmp/prs/<PR id>.description.md`.
+5. Re-run the script once more so its baseline matches what was pushed (expect `unchanged`).
+
 When not specified, default to opening PRs in "draft" rather than ready to review.

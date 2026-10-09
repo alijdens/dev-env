@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Renders AGENTS.md (resolving its {{AI_WORKFLOW_DOCS_DIR}} placeholder to this checkout's
 # docs/ dir) and symlinks the result, plus docs/ itself, into each selected tool's config dir.
+# Also adds bin/ to PATH in the shell rc files, so docs can reference its commands by name.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +53,39 @@ link() {
   echo "  linked: $dest -> $src"
 }
 
+# The marker identifies our line on re-runs, so a moved repo updates the path instead of adding a second line.
+add_bin_to_path() {
+  local marker="# dev-env:ai-workflow-bin"
+  local path_line="export PATH=\"$REPO_DIR/bin:\$PATH\" $marker"
+  local rc_files=() rc tmp
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    if [[ -f "$rc" ]]; then rc_files+=("$rc"); fi
+  done
+  if [[ ${#rc_files[@]} -eq 0 ]]; then
+    case "$(basename "${SHELL:-}")" in
+      zsh) rc_files=("$HOME/.zshrc") ;;
+      *) rc_files=("$HOME/.bashrc") ;;
+    esac
+    touch "${rc_files[0]}"
+  fi
+
+  echo "Adding $REPO_DIR/bin to PATH..."
+  for rc in "${rc_files[@]}"; do
+    tmp="$(mktemp)"
+    { grep -vF "$marker" "$rc" || true; echo "$path_line"; } > "$tmp"
+    if cmp -s "$tmp" "$rc"; then
+      echo "  already up to date: $rc"
+    else
+      # Write through instead of mv so a symlinked rc file stays a symlink.
+      cat "$tmp" > "$rc"
+      echo "  updated: $rc"
+    fi
+    rm -f "$tmp"
+  done
+}
+
 render
+add_bin_to_path
 
 for tool in "${selected[@]}"; do
   found=""
