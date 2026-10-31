@@ -1,0 +1,22 @@
+name: ai-workflow tests
+
+on:
+  push:
+    paths:
+      - "ai-workflow/**"
+      - ".github/workflows/ai-workflow-tests.yml"
+  pull_request:
+    paths:
+      - "ai-workflow/**"
+      - ".github/workflows/ai-workflow-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: pytest ai-workflow/tests

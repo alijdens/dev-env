@@ -1,0 +1,1788 @@
+#!/usr/bin/env python3
+"""Manages a project's architecture decisions, tasks and task dependencies.
+
+See ai-workflow/docs/task-workflow/ for the workflow. A project opts in in one of two modes:
+  shared  a `sdd: <path>` line in the repo's AGENTS.md (or CLAUDE.md); <path> is
+          relative to the repo root and may point into a separate repo. Claims and releases
+          are PRs against that repo's main branch.
+  local   `git config --local sdd.root <path>`, for repos you don't own: the data
+          lives only on this machine and claims are plain file moves.
+The local config wins when both are present. `--dir <path>` overrides both, for data that lives
+anywhere else: shared mode if <path> is inside a git repo, local mode otherwise.
+
+Layout under the data root:
+  arch/YYYY-MM-DD-<slug>.md              architecture decision records (immutable once accepted)
+  specs/<slug>.md                        living descriptions of how things are, updated by PRs
+  tasks/{todo,in-progress,tech-debt}/<slug>.md
+  tasks/done/YYYY-MM-DD/<slug>.md        grouped by the date `sdd done` ran
+  questions/{open,answered}/<slug>.md    open questions, linked to tasks and ADRs
+
+A task's state is the directory its file is in, and its prerequisites are the `after:` list in
+its frontmatter, so each task is one self-contained file: branches that add or finish different
+tasks never touch the same file and merge cleanly. The dependency graph is derived from those
+files (`sdd render`); done tasks keep their `after:` as history. Questions work the same way:
+one file each, linked through `tasks:`/`arch:` frontmatter, and an open question that `blocks:`
+a task keeps it out of `sdd ready` like an unmet prerequisite.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import namedtuple
+
+MARKER_RE = re.compile(r"^sdd:\s*(\S+)\s*$", re.M)
+SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ADR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$")
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
+OPEN_STATES = ("todo", "in-progress", "tech-debt")
+STARTABLE = ("todo", "tech-debt")
+QUESTION_STATES = ("open", "answered")
+ADR_STATUSES = ("proposed", "accepted", "superseded", "deprecated")
+ADR_MAX_LINES = 100
+CHECKS_SECTION = "Review checks"
+CHECKS_MAX = 10
+AGENT_FILES = ("AGENTS.md", "CLAUDE.md")
+LIST_KEYS = ("after", "arch", "spec", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by")
+LEGACY_STATUS_RE = re.compile(r"^- Status:\s*(.+?)\s*$", re.M)
+LEGACY_DATE_RE = re.compile(r"^- Date:\s*(\S+)\s*$", re.M)
+LOCAL_KEY = "sdd.root"
+REMOTE = "origin"
+TASK_TEMPLATE = """\
+---
+title: {title}
+after: [{after}]
+arch: [{arch}]
+---
+
+## Goal
+
+## Acceptance criteria
+
+## Notes
+"""
+ADR_TEMPLATE = """\
+---
+title: {title}
+status: proposed
+date: {date}
+areas: [{areas}]
+supersedes: [{supersedes}]
+amends: [{amends}]
+---
+
+# {title}
+
+## Context
+
+## Decision
+
+## Alternatives considered
+
+## Consequences
+"""
+SPEC_TEMPLATE = """\
+---
+title: {title}
+areas: [{areas}]
+arch: [{arch}]
+---
+
+# {title}
+"""
+Adr = namedtuple("Adr", "path meta legacy")
+Spec = namedtuple("Spec", "path meta")
+
+QUESTION_TEMPLATE = """\
+---
+title: {title}
+tasks: [{tasks}]
+arch: [{arch}]
+blocks: [{blocks}]
+asked: {date}
+---
+
+## Question
+
+## Context
+
+## Answer
+"""
+
+# Project-level docs that planning and reviews read first. Each section's comment is the brief
+# the setup interview follows and `sdd doc check` fails while any of them is still in the file.
+PROJECT_DOCS = {
+    "goal": ("goal.md", 60, """\
+# Goal
+
+<!-- Why the project exists, not how it's built: no stack, architecture or feature list here.
+Under 60 lines. A newcomer reads it once and can tell whether a proposal serves the project. -->
+
+## Problem
+
+<!-- What is wrong or missing today, and for whom. Two to five sentences. -->
+
+## Users
+
+<!-- Who it is for, one line per kind of user, and who it is explicitly not for. -->
+
+## Goal
+
+<!-- What the project achieves for them, as an outcome, in one or two sentences. -->
+
+## Success
+
+<!-- How you would know it worked: observable, measurable where possible. Three to five bullets. -->
+
+## Non-goals
+
+<!-- What the project deliberately won't do, so nobody plans it in. Bullets. -->
+
+## Glossary
+
+<!-- Domain terms with their meaning here, one line each. Only terms a newcomer would misuse. -->
+"""),
+    "principles": ("principles.md", 80, """\
+# Principles
+
+<!-- Rules a reviewer can check a change against: imperative, one or two lines each, with the
+reason when it isn't obvious. At most about 15 in total, under 80 lines. Not here: decisions
+(those are ADRs), preferences without consequences, or a restatement of the goal. Write
+"None." under a section that has no rule, so it reads as decided rather than forgotten. -->
+
+## Stack and boundaries
+
+<!-- Languages, frameworks and services the project commits to, and what needs an ADR to add. -->
+
+## Compatibility
+
+<!-- What must keep working across changes: APIs, data formats, migrations, supported versions. -->
+
+## Security and privacy
+
+<!-- Rules for secrets, auth, personal data, and what must never leave the system. -->
+
+## Quality
+
+<!-- Testing expectations, performance or cost budgets, the review bar. -->
+
+## Definition of done
+
+<!-- What a change needs before it merges: tests, docs, migration, flags, rollout steps. -->
+"""),
+}
+GUIDANCE_RE = re.compile(r"<!--.*?-->", re.S)
+
+Task = namedtuple("Task", "state path date meta")
+Question = namedtuple("Question", "state path meta")
+
+
+class Error(Exception):
+    pass
+
+
+def git(*args, cwd=None, check=True):
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise Error(f"git {' '.join(args)} failed:\n{r.stderr.strip()}")
+    return r
+
+
+def toplevel(path="."):
+    r = git("rev-parse", "--show-toplevel", cwd=path, check=False)
+    if r.returncode != 0:
+        raise Error(f"not inside a git repository: {os.path.abspath(path)}")
+    return r.stdout.strip()
+
+
+def try_toplevel(path="."):
+    try:
+        return toplevel(path)
+    except Error:
+        return None
+
+
+def read_marker(repo):
+    for name in AGENT_FILES:
+        path = os.path.join(repo, name)
+        if os.path.isfile(path):
+            with open(path) as f:
+                m = MARKER_RE.search(f.read())
+            if m:
+                return m.group(1), name
+    return None, None
+
+
+def local_root(repo):
+    r = git("config", "--local", "--get", LOCAL_KEY, cwd=repo, check=False)
+    return r.stdout.strip() or None
+
+
+def find_project(override_dir=None):
+    if override_dir:
+        root = os.path.abspath(os.path.expanduser(override_dir))
+        if not os.path.isdir(root):
+            raise Error(f"no such directory: {root}")
+        return Project(root, "shared" if try_toplevel(root) else "local")
+    repo = toplevel()
+    local = local_root(repo)
+    if local:
+        return Project(os.path.normpath(os.path.join(repo, os.path.expanduser(local))), "local")
+    marker, _ = read_marker(repo)
+    if marker is None:
+        raise Error(f"project not initialized for the task workflow (no `sdd: <path>` line in {' or '.join(AGENT_FILES)}, no `git config {LOCAL_KEY}`)")
+    return Project(os.path.normpath(os.path.join(repo, marker)), "shared")
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def check_slug(slug):
+    if not SLUG_RE.match(slug):
+        raise Error(f"invalid slug {slug!r}: use lowercase kebab-case")
+
+
+# --- frontmatter ---------------------------------------------------------------------------
+
+
+def parse_frontmatter(text):
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return None
+    meta = {}
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k, v = k.strip(), v.strip()
+        # Only known list keys are parsed as lists: a title like "[WIP] fix [x]" stays a string.
+        if k in LIST_KEYS:
+            if not (v.startswith("[") and v.endswith("]")):
+                raise Error(f"frontmatter field {k} must be a list like [a, b], got {v!r}")
+            v = [x.strip() for x in v[1:-1].split(",") if x.strip()]
+        meta[k] = v
+    return meta
+
+
+def frontmatter(path):
+    with open(path) as f:
+        meta = parse_frontmatter(f.read())
+    if meta is None:
+        raise Error(f"{path}: missing frontmatter")
+    return meta
+
+
+def set_meta(path, key, value):
+    """Sets a frontmatter field (lists as `[a, b]`), or removes it when value is None."""
+    with open(path) as f:
+        text = f.read()
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise Error(f"{path}: missing frontmatter")
+    rendered = None if value is None else (f"[{', '.join(value)}]" if isinstance(value, list) else str(value))
+    lines, done = [], False
+    for line in m.group(1).splitlines():
+        if line.split(":", 1)[0].strip() == key:
+            if rendered is not None and not done:
+                lines.append(f"{key}: {rendered}")
+                done = True
+            continue
+        lines.append(line)
+    if rendered is not None and not done:
+        lines.append(f"{key}: {rendered}")
+    with open(path, "w") as f:
+        f.write("---\n" + "\n".join(lines) + "\n---\n" + text[m.end():])
+
+
+def sections(path):
+    """Maps each `## heading` in the body to its text, stripped."""
+    with open(path) as f:
+        text = f.read()
+    m = FRONTMATTER_RE.match(text)
+    out, current = {}, None
+    for line in (text[m.end():] if m else text).splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip()
+            out[current] = []
+        elif current is not None:
+            out[current].append(line)
+    return {k: "\n".join(v).strip() for k, v in out.items()}
+
+
+# --- graph ---------------------------------------------------------------------------------
+
+
+class Graph:
+    def __init__(self, nodes=None, edges=None):
+        self.nodes = set(nodes or ())
+        self.edges = set(edges or ())  # (prereq, task)
+
+    @classmethod
+    def from_tasks(cls, tasks):
+        g = cls(tasks)
+        for slug, t in tasks.items():
+            g.edges.update((p, slug) for p in t.meta.get("after") or [])
+        return g
+
+    def prereqs(self, slug):
+        return sorted(a for a, b in self.edges if b == slug)
+
+    def dependents(self, slug):
+        return sorted(b for a, b in self.edges if a == slug)
+
+    def find_cycle(self):
+        adj = {n: [] for n in self.nodes}
+        for a, b in self.edges:
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, [])
+        color, stack = {}, []
+
+        def visit(n):
+            color[n] = 1
+            stack.append(n)
+            for m in sorted(adj[n]):
+                if color.get(m) == 1:
+                    return stack[stack.index(m):] + [m]
+                if m not in color:
+                    c = visit(m)
+                    if c:
+                        return c
+            stack.pop()
+            color[n] = 2
+            return None
+
+        for n in sorted(adj):
+            if n not in color:
+                c = visit(n)
+                if c:
+                    return c
+        return None
+
+
+
+# --- project -------------------------------------------------------------------------------
+
+
+class Project:
+    def __init__(self, root, mode="shared"):
+        self.root = root
+        self.mode = mode
+        self.tasks_dir = os.path.join(root, "tasks")
+        self.arch_dir = os.path.join(root, "arch")
+        self.questions_dir = os.path.join(root, "questions")
+
+    def state_dirs(self):
+        yield from (os.path.join(self.tasks_dir, s) for s in OPEN_STATES)
+        yield from (os.path.join(self.questions_dir, s) for s in QUESTION_STATES)
+
+    def ensure_dirs(self):
+        # Without a placeholder, moving the last file out of a state dir looks like a directory
+        # rename to git, and merges then move files that other branches added there.
+        for d in self.state_dirs():
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, ".gitkeep"), "a").close()
+
+    def question_files(self):
+        """Yields (slug, state, path)."""
+        for state in QUESTION_STATES:
+            d = os.path.join(self.questions_dir, state)
+            if os.path.isdir(d):
+                for name in sorted(os.listdir(d)):
+                    if name.endswith(".md"):
+                        yield name[:-3], state, os.path.join(d, name)
+
+    def questions(self):
+        """Maps slug -> Question. Duplicates are reported by `validate`; last one wins here."""
+        return {slug: Question(state, path, frontmatter(path)) for slug, state, path in self.question_files()}
+
+    def get_question(self, slug, questions=None):
+        q = (questions if questions is not None else self.questions()).get(slug)
+        if not q:
+            raise Error(f"unknown question: {slug}")
+        return q
+
+    def task_files(self):
+        """Yields (slug, state, path, done_date)."""
+        for state in OPEN_STATES:
+            d = os.path.join(self.tasks_dir, state)
+            if os.path.isdir(d):
+                for name in sorted(os.listdir(d)):
+                    if name.endswith(".md"):
+                        yield name[:-3], state, os.path.join(d, name), None
+        done = os.path.join(self.tasks_dir, "done")
+        if os.path.isdir(done):
+            for date in sorted(os.listdir(done)):
+                d = os.path.join(done, date)
+                if os.path.isdir(d):
+                    for name in sorted(os.listdir(d)):
+                        if name.endswith(".md"):
+                            yield name[:-3], "done", os.path.join(d, name), date
+
+    def tasks(self):
+        """Maps slug -> Task. Duplicates are reported by `validate`; last one wins here."""
+        if not os.path.isdir(self.tasks_dir):
+            raise Error(f"missing {self.tasks_dir} (run `sdd init`?)")
+        return {slug: Task(state, path, date, frontmatter(path)) for slug, state, path, date in self.task_files()}
+
+    def get(self, slug, tasks=None):
+        t = (tasks if tasks is not None else self.tasks()).get(slug)
+        if not t:
+            raise Error(f"unknown task: {slug}")
+        return t
+
+    def adrs(self):
+        if not os.path.isdir(self.arch_dir):
+            return {}
+        return {n[:-3]: os.path.join(self.arch_dir, n) for n in sorted(os.listdir(self.arch_dir)) if n.endswith(".md")}
+
+    def adr_metas(self):
+        """Maps name -> Adr; ADRs from before frontmatter are parsed from their heading and bullets."""
+        return {name: Adr(path, *adr_meta(path)) for name, path in self.adrs().items()}
+
+    def specs(self):
+        d = os.path.join(self.root, "specs")
+        if not os.path.isdir(d):
+            return {}
+        return {n[:-3]: Spec(os.path.join(d, n), frontmatter(os.path.join(d, n))) for n in sorted(os.listdir(d)) if n.endswith(".md")}
+
+    def move(self, path, dest_dir):
+        self.ensure_dirs()
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, os.path.basename(path))
+        os.rename(path, dest)
+        return dest
+
+
+def adr_meta(path):
+    """Returns (meta, legacy): legacy ADRs have `# title` and `- Status:`/`- Date:` bullets instead of frontmatter."""
+    with open(path) as f:
+        text = f.read()
+    meta = parse_frontmatter(text)
+    if meta is not None:
+        return meta, False
+    title = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
+    status = (LEGACY_STATUS_RE.search(text) or [None, "accepted"])[1]
+    date = (LEGACY_DATE_RE.search(text) or [None, ""])[1]
+    meta = {"title": title, "status": status, "date": date}
+    if status.startswith("superseded by "):
+        meta["status"], meta["superseded-by"] = "superseded", [status[len("superseded by "):].strip()]
+    return meta, True
+
+
+def adr_body(text):
+    """An accepted ADR's immutable part: everything but the frontmatter, `## Errata` and `## Review checks`.
+
+    Review checks are how reviewers verify the decision holds, so they may grow as reviews learn, unlike the decision.
+    """
+    m = FRONTMATTER_RE.match(text)
+    body = text[m.end():] if m else text
+    return re.sub(rf"^## (Errata|{CHECKS_SECTION})\n.*?(?=^## |\Z)", "", body, flags=re.S | re.M).strip()
+
+
+def review_checks(path):
+    """The bullets of a `## Review checks` section (indented lines continue the previous one), and the lines that are neither."""
+    bullets, prose = [], []
+    for line in sections(path).get(CHECKS_SECTION, "").splitlines():
+        if line.startswith("- "):
+            bullets.append(line)
+        elif line.startswith(" ") and bullets:
+            bullets[-1] += "\n" + line
+        elif line.strip():
+            prose.append(line)
+    return bullets, prose
+
+
+def adr_refs(adrs, tasks, specs):
+    """How many tasks and specs reference each ADR: the most referenced ones are the project's foundations."""
+    refs = {name: 0 for name in adrs}
+    for items in (tasks.values(), specs.values()):
+        for item in items:
+            for a in item.meta.get("arch") or []:
+                if a in refs:
+                    refs[a] += 1
+    return refs
+
+
+def area_matches(wanted, areas):
+    """`backend` matches `backend` and `backend/auth`: area paths go from generic to specific."""
+    return any(a == w or a.startswith(w + "/") for w in wanted for a in areas)
+
+
+def claim_stamp(repo):
+    # Unique per claim, so two claim PRs for the same task write different content to the same
+    # file and the second one conflicts once the first is merged, instead of merging cleanly.
+    who = git("config", "user.email", cwd=repo, check=False).stdout.strip() if repo else ""
+    who_part = f" {who}" if who else ""
+    return f"{datetime.datetime.now().astimezone().isoformat(timespec='seconds')}{who_part} {os.urandom(3).hex()}"
+
+
+def unmet(g, slug, tasks):
+    return [p for p in g.prereqs(slug) if tasks.get(p, Task(None, None, None, {})).state != "done"]
+
+
+def open_blockers(questions, slug):
+    return sorted(q for q, v in questions.items() if v.state == "open" and slug in (v.meta.get("blocks") or []))
+
+
+def not_ready(g, slug, tasks, questions):
+    """Why a task can't start: unmet prerequisites and open blocking questions, for messages."""
+    return unmet(g, slug, tasks) + [f"question {q}" for q in open_blockers(questions, slug)]
+
+
+def check_dag(tasks):
+    cycle = Graph.from_tasks(tasks).find_cycle()
+    if cycle:
+        raise Error("dependency cycle: " + " -> ".join(cycle))
+
+
+def downstream(g, slugs):
+    """The given tasks plus everything that transitively depends on them."""
+    seen, stack = set(), list(slugs)
+    while stack:
+        s = stack.pop()
+        if s not in seen:
+            seen.add(s)
+            stack.extend(g.dependents(s))
+    return seen
+
+
+# --- PRs against main ----------------------------------------------------------------------
+
+
+def default_branch(repo):
+    r = git("symbolic-ref", "--short", f"refs/remotes/{REMOTE}/HEAD", cwd=repo, check=False)
+    if r.returncode == 0:
+        return r.stdout.strip().split("/", 1)[1]
+    # origin/HEAD only exists after a clone; `git remote add` leaves it unset, so ask the remote.
+    r = git("ls-remote", "--symref", REMOTE, "HEAD", cwd=repo, check=False)
+    m = re.search(r"^ref: refs/heads/(\S+)\tHEAD$", r.stdout, re.M)
+    return m.group(1) if m else "main"
+
+
+def open_pr(proj, branch, title, body, mutate, create_pr=True):
+    """Applies `mutate(Project, repo)` on top of the remote main branch and opens a PR with it.
+
+    Runs in a throwaway worktree, so it works with a dirty checkout and never touches the
+    caller's branch. `branch` is deterministic per task and pushed without force, so a
+    concurrent claim of the same task fails at push time rather than at merge time.
+    """
+    repo = toplevel(proj.root)
+    rel = os.path.relpath(proj.root, repo)
+    base = default_branch(repo)
+    git("fetch", REMOTE, base, cwd=repo)
+    tmp = tempfile.mkdtemp(prefix="tasks-")
+    try:
+        git("worktree", "add", "--detach", tmp, f"{REMOTE}/{base}", cwd=repo)
+        mutate(Project(os.path.join(tmp, rel), proj.mode), repo)
+        git("add", "-A", "--", rel, cwd=tmp)
+        git("commit", "-m", title, cwd=tmp)
+        r = git("push", REMOTE, f"HEAD:refs/heads/{branch}", cwd=tmp, check=False)
+        if r.returncode != 0:
+            raise Error(f"could not push {branch} (an open PR from that branch may already exist):\n{r.stderr.strip()}")
+        if not create_pr:
+            return f"pushed {branch}"
+        r = subprocess.run(["gh", "pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body],
+                           cwd=tmp, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Error(f"pushed {branch} but `gh pr create` failed:\n{r.stderr.strip()}")
+        return r.stdout.strip()
+    finally:
+        git("worktree", "remove", "--force", tmp, cwd=repo, check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def porcelain(repo, rel):
+    """Uncommitted changes under `rel` as (status, path) pairs, one per file, renames shown as delete plus add."""
+    out = git("status", "--porcelain=v1", "-uall", "--no-renames", "-z", "--", rel, cwd=repo).stdout
+    return [(e[:2], e[3:]) for e in out.split("\0") if e]
+
+
+def sync_with_main(repo, base, rel):
+    """Drops uncommitted changes under `rel` that already match the remote main branch and fast-forwards
+    the checkout when nothing else stands in the way. Returns the paths it kept because they differ.
+
+    A session that ships its work through a worktree, or pulls a merged file in by hand, leaves the
+    checkout with changes identical to main; `stale` then fails although nothing would be lost.
+    """
+    target = f"{REMOTE}/{base}"
+    kept = []
+    for _, path in porcelain(repo, rel):
+        full = os.path.join(repo, path)
+        on_main = git("rev-parse", "--verify", "--quiet", f"{target}:{path}", cwd=repo, check=False)
+        if on_main.returncode == 0:
+            same = os.path.isfile(full) and git("hash-object", "--", path, cwd=repo).stdout.strip() == on_main.stdout.strip()
+            if same:
+                git("checkout", target, "--", path, cwd=repo)
+                print(f"dropped {path}: same as {target}")
+                continue
+        elif not os.path.lexists(full):
+            git("rm", "-q", "--cached", "--", path, cwd=repo, check=False)
+            print(f"dropped {path}: deleted on {target} too")
+            continue
+        kept.append(path)
+        print(f"kept {path}: differs from {target}")
+    if not kept:
+        branch = git("symbolic-ref", "--short", "-q", "HEAD", cwd=repo, check=False).stdout.strip()
+        if branch != base:
+            print(f"on {branch or 'a detached HEAD'}, not {base}: not fast-forwarding")
+        else:
+            r = git("merge", "--ff-only", "-q", target, cwd=repo, check=False)
+            if r.returncode != 0:
+                print(f"could not fast-forward to {target}:\n{r.stderr.strip()}")
+    return kept
+
+
+def merge_pr(url, cwd):
+    """Squash-merges a PR and deletes its branch. GitHub computes mergeability after the PR opens, so a merge
+    right after `gh pr create` can be refused for a few seconds; retried briefly, then the caller gets the error."""
+    for attempt in range(3):
+        r = subprocess.run(["gh", "pr", "merge", url, "--squash", "--delete-branch"], cwd=cwd, capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        if attempt < 2:
+            time.sleep(3)
+    raise Error(f"{url} is open but `gh pr merge` failed:\n{r.stderr.strip()}")
+
+
+def slugify(text, limit=40):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")[:limit].rstrip("-") or "changes"
+
+
+# --- project docs --------------------------------------------------------------------------
+
+
+def doc_status(proj, name):
+    """Returns (status, issues): missing, draft (template guidance left or sections empty) or ok."""
+    filename, max_lines, template = PROJECT_DOCS[name]
+    path = os.path.join(proj.root, filename)
+    if not os.path.isfile(path):
+        return "missing", []
+    with open(path) as f:
+        text = f.read()
+    issues = []
+    if GUIDANCE_RE.search(text):
+        issues.append("still has template guidance comments")
+    body = sections(path)
+    for heading in sections_of(template):
+        if heading not in body:
+            issues.append(f"missing `## {heading}` section")
+        elif not GUIDANCE_RE.sub("", body[heading]).strip():
+            issues.append(f"empty `## {heading}` section")
+    lines = len(text.splitlines())
+    if lines > max_lines:
+        issues.append(f"{lines} lines, over the {max_lines}-line limit: it should fit in one read")
+    return ("draft" if issues else "ok"), issues
+
+
+def sections_of(template):
+    return [line[3:].strip() for line in template.splitlines() if line.startswith("## ")]
+
+
+def doc_path(proj, name):
+    return os.path.join(proj.root, PROJECT_DOCS[name][0])
+
+
+def cmd_doc(args):
+    proj = find_project(args.dir)
+    if args.action == "new":
+        if not args.name:
+            raise Error(f"doc new needs a name: {', '.join(PROJECT_DOCS)}")
+        path = doc_path(proj, args.name)
+        if os.path.exists(path) and not args.force:
+            raise Error(f"{path} already exists (--force overwrites it)")
+        with open(path, "w") as f:
+            f.write(PROJECT_DOCS[args.name][2])
+        print(path)
+    elif args.action == "list":
+        for name in PROJECT_DOCS:
+            status, _ = doc_status(proj, name)
+            print("\t".join([name, status, doc_path(proj, name)]))
+    else:
+        failed = False
+        for name in PROJECT_DOCS:
+            status, issues = doc_status(proj, name)
+            if status == "draft":
+                failed = True
+                for issue in issues:
+                    print(f"{doc_path(proj, name)}: {issue}")
+            else:
+                print(f"{name}: {status}")
+        return 1 if failed else 0
+
+
+# --- commands ------------------------------------------------------------------------------
+
+
+SECTION_HEADER = "<!-- sdd:start -->"
+SECTION_FOOTER = "<!-- sdd:end -->"
+
+
+def tooling_url():
+    """Where this CLI and the skills come from, so a repo's agent file can point readers there."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    r = git("remote", "get-url", REMOTE, cwd=here, check=False)
+    url = r.stdout.strip()
+    if not url:
+        return None
+    m = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+?)(?:\.git)?$", url)
+    if m:
+        url = f"https://{m.group(1)}/{m.group(2)}"
+    return url.removesuffix(".git")
+
+
+def format_section(path):
+    url = tooling_url()
+    origin = f"installed from {url} (`ai-workflow/install.sh`)" if url else "installed by the `ai-workflow` tooling (`install.sh`)"
+    return (
+        f"{SECTION_HEADER}\n"
+        f"## Task workflow\n\n"
+        f"This project tracks architecture decisions and tasks with the `sdd` CLI. The CLI and the agent skills it relies on "
+        f"(`sdd-planning`, `sdd-claim-task`, `sdd-review-task`, `sdd-orchestrate`) are {origin}.\n\n"
+        f"sdd: {path}\n\n"
+        f"When planning a feature, use the `sdd-planning` skill. When working on or claiming a task, use the `sdd-claim-task` skill. When reviewing a task's PR, use the `sdd-review-task` skill. When orchestrating tasks with sub-agents, use the `sdd-orchestrate` skill. "
+        f"To write or revise the project's goal or principles docs, use the `sdd-setup-task-workflow` skill.\n\n"
+        f"`{path}/goal.md` and `{path}/principles.md`, when present, say what the project is for and the rules every change must respect: read them before planning or reviewing, and treat them as the context every task belongs to. "
+        f"`sdd checks --task <slug>` prints the project-specific review checks for a task's areas.\n"
+        f"{SECTION_FOOTER}\n"
+    )
+
+
+def update_agent_file(path, data_path):
+    content = ""
+    if os.path.isfile(path):
+        with open(path) as f:
+            content = f.read()
+
+    new_section = format_section(data_path)
+    if SECTION_HEADER in content and SECTION_FOOTER in content:
+        pattern = re.compile(rf"{re.escape(SECTION_HEADER)}.*?{re.escape(SECTION_FOOTER)}\n?", re.S)
+        updated = pattern.sub(new_section, content)
+    else:
+        sep = "\n\n" if content and not content.endswith("\n\n") else ("\n" if content and not content.endswith("\n") else "")
+        updated = content + sep + new_section
+
+    with open(path, "w") as f:
+        f.write(updated)
+
+
+def cmd_init(args):
+    if args.dir:
+        if args.path or args.local or args.agent_file:
+            raise Error("--dir only creates the layout; to configure a repo use `sdd init [--local] <path>`")
+        root = os.path.abspath(os.path.expanduser(args.dir))
+    elif args.local:
+        if args.agent_file:
+            raise Error("--agent-file only applies to shared mode")
+        repo = toplevel()
+        current = local_root(repo)
+        args.path = args.path or current
+        if not args.path:
+            raise Error("--local needs a path for the data, e.g. ~/task-data/<project>")
+        root = os.path.abspath(os.path.expanduser(args.path))
+        git("config", "--local", LOCAL_KEY, root, cwd=repo)
+        action = "updated" if current else "set"
+        print(f"{action} `git config --local {LOCAL_KEY} {root}`")
+    else:
+        repo = toplevel()
+        marker, marker_file = read_marker(repo)
+        args.path = args.path or marker or "docs"
+        root = os.path.normpath(os.path.join(repo, args.path))
+    proj = Project(root)
+    os.makedirs(proj.arch_dir, exist_ok=True)
+    proj.ensure_dirs()
+    if not args.local and not args.dir:
+        # Keep the section where it already is unless told otherwise; a repo with both files
+        # gets it in AGENTS.md, which CLAUDE.md can pull in with an `@AGENTS.md` line.
+        name = args.agent_file or marker_file or next((n for n in AGENT_FILES if os.path.isfile(os.path.join(repo, n))), AGENT_FILES[0])
+        if marker_file and name != marker_file:
+            raise Error(f"the `sdd:` line already lives in {marker_file}; remove its section before moving it to {name}")
+        agent_file = os.path.join(repo, name)
+        update_agent_file(agent_file, args.path)
+        action = "updated" if marker else "added"
+        print(f"{action} task workflow instructions and `sdd: {args.path}` in {agent_file}")
+        if name == "AGENTS.md" and not os.path.isfile(os.path.join(repo, "CLAUDE.md")):
+            print("note: Claude Code only loads CLAUDE.md; add one containing `@AGENTS.md` if the repo is used with it")
+
+
+
+def cmd_root(args):
+    proj = find_project(args.dir)
+    print(f"{proj.root}\nmode: {proj.mode}")
+
+
+def cmd_stale(args):
+    """Fails when the data root's checkout isn't what main has, so planning doesn't start from a stale view."""
+    proj = find_project(args.dir)
+    if proj.mode == "local":
+        print("local mode: nothing to sync")
+        return
+    repo = toplevel(proj.root)
+    base = default_branch(repo)
+    git("fetch", REMOTE, base, cwd=repo)
+    rel = os.path.relpath(proj.root, repo)
+    if args.fix:
+        sync_with_main(repo, base, rel)
+    behind = int(git("rev-list", "--count", f"HEAD..{REMOTE}/{base}", "--", rel, cwd=repo).stdout.strip() or 0)
+    dirty = git("status", "--porcelain", "--", rel, cwd=repo).stdout.strip()
+    problems = []
+    if behind:
+        problems.append(f"behind {REMOTE}/{base} by {behind} commits touching {rel}: pull first")
+    if dirty:
+        problems.append(f"uncommitted changes under {rel}:\n{dirty}")
+    if problems:
+        print("\n".join(problems))
+        return 1
+    print(f"up to date with {REMOTE}/{base}")
+
+
+def cmd_new(args):
+    check_slug(args.slug)
+    proj = find_project(args.dir)
+    tasks = proj.tasks()
+    if args.slug in tasks:
+        raise Error(f"task {args.slug} already exists")
+    adrs = proj.adrs()
+    for a in args.arch:
+        if a not in adrs:
+            raise Error(f"unknown architecture decision: {a}")
+    for p in args.after:
+        if p not in tasks:
+            raise Error(f"unknown prerequisite: {p}")
+    specs = proj.specs()
+    for s in args.spec:
+        if s not in specs:
+            raise Error(f"unknown spec: {s}")
+    state = "tech-debt" if args.tech_debt else "todo"
+    proj.ensure_dirs()
+    path = os.path.join(proj.tasks_dir, state, f"{args.slug}.md")
+    with open(path, "w") as f:
+        f.write(TASK_TEMPLATE.format(title=args.title, after=", ".join(args.after), arch=", ".join(args.arch)))
+    if args.spec:
+        set_meta(path, "spec", args.spec)
+    print(path)
+
+
+def cmd_adr(args):
+    check_slug(args.slug)
+    proj = find_project(args.dir)
+    adrs = proj.adr_metas()
+    for name in adrs:
+        m = ADR_RE.match(name + ".md")
+        if m and m.group(2) == args.slug:
+            raise Error(f"architecture decision with slug {args.slug} already exists: {name}")
+    name = f"{today()}-{args.slug}"
+    for key, back in (("supersedes", "superseded-by"), ("amends", "amended-by")):
+        for old in getattr(args, key):
+            if old not in adrs:
+                raise Error(f"unknown architecture decision: {old}")
+            if adrs[old].legacy:
+                raise Error(f"{adrs[old].path} has no frontmatter to record `{back}` in")
+    os.makedirs(proj.arch_dir, exist_ok=True)
+    path = os.path.join(proj.arch_dir, f"{name}.md")
+    with open(path, "w") as f:
+        f.write(ADR_TEMPLATE.format(title=args.title, date=today(), areas=", ".join(args.areas),
+                                    supersedes=", ".join(args.supersedes), amends=", ".join(args.amends)))
+    # The old ADR's body stays as written; only its frontmatter points forward.
+    for key, back in (("supersedes", "superseded-by"), ("amends", "amended-by")):
+        for old in getattr(args, key):
+            current = adrs[old].meta.get(back) or []
+            set_meta(adrs[old].path, back, current + [name] if name not in current else current)
+            if key == "supersedes" and adrs[old].meta.get("status") != "superseded":
+                set_meta(adrs[old].path, "status", "superseded")
+    print(path)
+
+
+def cmd_accept(args):
+    """Marks proposed ADRs accepted once the plan is agreed; from then on `validate` guards their body."""
+    proj = find_project(args.dir)
+    adrs = proj.adr_metas()
+    for name in args.adrs:
+        a = adrs.get(name)
+        if not a:
+            raise Error(f"unknown architecture decision: {name}")
+        if a.legacy:
+            raise Error(f"{a.path} has no frontmatter to record the status in")
+        if a.meta.get("status") != "proposed":
+            raise Error(f"{name} is {a.meta.get('status')}, not proposed")
+        set_meta(a.path, "status", "accepted")
+        print(f"accepted {name}")
+
+
+def cmd_adrs(args):
+    proj = find_project(args.dir)
+    adrs, tasks, specs = proj.adr_metas(), proj.tasks(), proj.specs()
+    refs = adr_refs(adrs, tasks, specs)
+    for name, a in sorted(adrs.items(), key=lambda kv: (-refs[kv[0]], kv[0])):
+        if args.area and not area_matches(args.area, a.meta.get("areas") or []):
+            continue
+        print("\t".join([name, a.meta.get("status", ""), str(refs[name]), ",".join(a.meta.get("areas") or []), a.meta.get("title", "")]))
+
+
+def cmd_areas(args):
+    proj = find_project(args.dir)
+    counts = {}
+    for items in (proj.adr_metas().values(), proj.specs().values()):
+        for item in items:
+            for area in item.meta.get("areas") or []:
+                counts[area] = counts.get(area, 0) + 1
+    for area, n in sorted(counts.items()):
+        print(f"{n}\t{area}")
+
+
+def cmd_context(args):
+    """A reading list for planning in some areas: foundations, matching ADRs and specs, and the work and questions around them."""
+    proj = find_project(args.dir)
+    adrs, tasks, specs, questions = proj.adr_metas(), proj.tasks(), proj.specs(), proj.questions()
+    refs = adr_refs(adrs, tasks, specs)
+    words = [w.lower() for w in args.grep]
+
+    def matches(path, meta):
+        if args.area and area_matches(args.area, meta.get("areas") or []):
+            return True
+        if words:
+            with open(path) as f:
+                text = f.read().lower()
+            return any(w in text for w in words)
+        return False
+
+    threshold = max(3, len(tasks) // 3)
+    foundations = [n for n in adrs if refs[n] >= threshold]
+    matched = [n for n, a in adrs.items() if n not in foundations and matches(a.path, a.meta)]
+    matched_specs = [n for n, s in specs.items() if matches(s.path, s.meta)]
+    if not args.area and not words:
+        print("no --area or --grep given: showing only the foundations (`sdd areas` lists the areas in use)")
+
+    def adr_line(n):
+        a = adrs[n]
+        note = "".join(f" ({k} {', '.join(a.meta[k])})" for k in ("superseded-by", "amended-by") if a.meta.get(k))
+        return f"  {n}\t{a.meta.get('status', '')}\t{refs[n]} refs\t{a.meta.get('title', '')}{note}"
+
+    print(f"foundations (ADRs referenced by at least {threshold} tasks or specs):")
+    for n in sorted(foundations, key=lambda n: -refs[n]):
+        print(adr_line(n))
+    print("matching ADRs:")
+    for n in sorted(matched, key=lambda n: (adrs[n].meta.get("status") != "accepted", -refs[n], n)):
+        print(adr_line(n))
+    print("matching specs:")
+    for n in matched_specs:
+        print(f"  {n}\t{specs[n].meta.get('title', '')}")
+    relevant = set(foundations if not matched else []) | set(matched)
+    print("tasks referencing the matching ADRs or specs:")
+    for slug, t in sorted(tasks.items(), key=lambda kv: (kv[1].state != "done", kv[0])):
+        if relevant & set(t.meta.get("arch") or []) or set(matched_specs) & set(t.meta.get("spec") or []):
+            print(f"  {slug}\t{t.state}\t{t.meta.get('title', '')}")
+    print("questions on them (answered ones may carry requirements):")
+    for slug, q in sorted(questions.items(), key=lambda kv: (kv[1].state != "open", kv[0])):
+        if relevant & set(q.meta.get("arch") or []):
+            print(f"  {slug}\t{q.state}\t{q.meta.get('title', '')}")
+
+
+def cmd_checks(args):
+    """Project-specific review checks: the `## Review checks` of ADRs and specs in the given areas or linked to a task."""
+    print_checks(find_project(args.dir), args.area, args.task)
+
+
+def print_checks(proj, wanted_areas, task):
+    adrs, specs = proj.adr_metas(), proj.specs()
+    areas, linked = list(wanted_areas), set()
+    if task:
+        t = proj.get(task)
+        linked = set(t.meta.get("arch") or []) | set(t.meta.get("spec") or [])
+        for name in linked:
+            item = adrs.get(name) or specs.get(name)
+            if item:
+                areas += [a for a in item.meta.get("areas") or [] if a not in areas]
+    live = {n: a for n, a in adrs.items() if a.meta.get("status") in ("proposed", "accepted")}
+    for name, item in sorted(list(live.items()) + list(specs.items())):
+        if (areas or task) and name not in linked and not area_matches(areas, item.meta.get("areas") or []):
+            continue
+        bullets, _ = review_checks(item.path)
+        if not bullets:
+            continue
+        print(f"{name}\t{','.join(item.meta.get('areas') or [])}\t{item.meta.get('title', '')}")
+        for b in bullets:
+            print("  " + b.replace("\n", "\n  "))
+
+
+def cmd_link(args):
+    """Adds ADR or spec links to a task in any state: a missing link is a fact about history, not a re-plan."""
+    proj = find_project(args.dir)
+    t = proj.get(args.slug)
+    adrs, specs = proj.adrs(), proj.specs()
+    for a in args.arch:
+        if a not in adrs:
+            raise Error(f"unknown architecture decision: {a}")
+    for s in args.spec:
+        if s not in specs:
+            raise Error(f"unknown spec: {s}")
+    for key, new in (("arch", args.arch), ("spec", args.spec)):
+        if new:
+            current = list(t.meta.get(key) or [])
+            set_meta(t.path, key, current + [x for x in new if x not in current])
+
+
+def cmd_defer(args):
+    proj = find_project(args.dir)
+    q = proj.get_question(args.slug)
+    if q.state != "open":
+        raise Error(f"question {args.slug} is {q.state}, not open")
+    tasks = proj.tasks()
+    for s in args.until:
+        proj.get(s, tasks)
+    set_meta(q.path, "revisit", args.until)
+    print(f"deferred {args.slug} until {', '.join(args.until)} are done")
+
+
+def deferred(q, tasks):
+    """An open question waiting on tasks that aren't done yet stays out of the default list."""
+    pending = [s for s in q.meta.get("revisit") or [] if tasks.get(s, Task(None, None, None, {})).state != "done"]
+    return q.state == "open" and pending
+
+
+def cmd_spec(args):
+    check_slug(args.slug)
+    proj = find_project(args.dir)
+    if args.slug in proj.specs():
+        raise Error(f"spec {args.slug} already exists")
+    adrs = proj.adrs()
+    for a in args.arch:
+        if a not in adrs:
+            raise Error(f"unknown architecture decision: {a}")
+    d = os.path.join(proj.root, "specs")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{args.slug}.md")
+    with open(path, "w") as f:
+        f.write(SPEC_TEMPLATE.format(title=args.title, areas=", ".join(args.areas), arch=", ".join(args.arch)))
+    print(path)
+
+
+def cmd_dep(args):
+    proj = find_project(args.dir)
+    tasks = proj.tasks()
+    for s in [args.task, *args.prereqs]:
+        proj.get(s, tasks)
+    t = tasks[args.task]
+    if t.state not in STARTABLE:
+        # Changing the plan of claimed or finished work behind its owner's back is how two plans
+        # for the same task come about; follow-up tasks that depend on it are the way instead.
+        raise Error(f"{args.task} is {t.state}: its prerequisites are fixed; plan follow-up tasks with `--after {args.task}` instead")
+    current = list(t.meta.get("after") or [])
+    if args.action == "add":
+        if args.task in args.prereqs:
+            raise Error("a task can't depend on itself")
+        after = current + [p for p in args.prereqs if p not in current]
+    else:
+        missing = [p for p in args.prereqs if p not in current]
+        if missing:
+            raise Error("no such dependencies: " + ", ".join(f"{p} -> {args.task}" for p in sorted(missing)))
+        after = [p for p in current if p not in args.prereqs]
+    tasks[args.task] = t._replace(meta={**t.meta, "after": after})
+    check_dag(tasks)
+    set_meta(t.path, "after", after)
+
+
+def cmd_rm(args):
+    proj = find_project(args.dir)
+    tasks = proj.tasks()
+    t = proj.get(args.slug, tasks)
+    if t.state not in STARTABLE:
+        raise Error(f"only todo/tech-debt tasks can be removed; {args.slug} is {t.state}")
+    deps = Graph.from_tasks(tasks).dependents(args.slug)
+    if deps:
+        raise Error(f"{args.slug} is a prerequisite of: {', '.join(deps)} (remove those dependencies first)")
+    os.remove(t.path)
+    proj.ensure_dirs()
+
+
+def cmd_list(args):
+    proj = find_project(args.dir)
+    for slug, t in proj.tasks().items():
+        if args.state and t.state != args.state:
+            continue
+        print("\t".join([slug, t.state if not t.date else f"done/{t.date}", t.meta.get("title", ""), t.meta.get("claimed", "")]))
+
+
+def cmd_ready(args):
+    proj = find_project(args.dir)
+    tasks, questions = proj.tasks(), proj.questions()
+    g = Graph.from_tasks(tasks)
+    ready = [s for s, t in tasks.items() if t.state in STARTABLE and not not_ready(g, s, tasks, questions)]
+    # The last column counts the tasks waiting behind each one, transitively, so whoever picks
+    # the next task can start the one that frees the most work.
+    behind = {s: len(downstream(g, [s])) - 1 for s in ready}
+    for slug in sorted(ready, key=lambda s: (-behind[s], s)):
+        print("\t".join([slug, tasks[slug].state, tasks[slug].meta.get("title", ""), str(behind[slug])]))
+
+
+def cmd_show(args):
+    proj = find_project(args.dir)
+    print_show(proj, args.slug, proj.tasks(), proj.questions())
+
+
+def linked_questions(questions, slug):
+    return [(s, q) for s, q in sorted(questions.items()) if slug in (q.meta.get("tasks") or []) or slug in (q.meta.get("blocks") or [])]
+
+
+def print_show(proj, slug, tasks, questions):
+    g = Graph.from_tasks(tasks)
+    t = proj.get(slug, tasks)
+    adrs = proj.adrs()
+    print(f"slug: {slug}\nstate: {t.state}\ntitle: {t.meta.get('title', '')}\nfile: {t.path}")
+    if t.meta.get("claimed"):
+        print(f"claimed: {t.meta['claimed']}")
+    state_of = lambda s: tasks[s].state if s in tasks else "missing"
+    print("prereqs:" + "".join(f"\n  {p}\t{state_of(p)}" for p in g.prereqs(slug)))
+    print("dependents:" + "".join(f"\n  {d}\t{state_of(d)}" for d in g.dependents(slug)))
+    print("arch:" + "".join(f"\n  {adrs.get(a, a + ' (missing)')}" for a in t.meta.get("arch") or []))
+    specs = proj.specs()
+    print("specs:" + "".join(f"\n  {specs[s].path if s in specs else s + ' (missing)'}" for s in t.meta.get("spec") or []))
+    related = linked_questions(questions, slug)
+    print("questions:" + "".join(f"\n  {s}\t{q.state}{' (blocks this task)' if slug in (q.meta.get('blocks') or []) else ''}\t{q.path}" for s, q in related))
+    if t.state in STARTABLE:
+        blockers = not_ready(g, slug, tasks, questions)
+        print("ready: " + ("yes" if not blockers else "no, waiting on " + ", ".join(blockers)))
+
+
+def cmd_brief(args):
+    """Prints a task and everything linked to it in full: what `working.md` asks a worker to read, and with
+    `--review` what `reviewing.md` asks a reviewer to read, in one bounded output instead of a dozen reads."""
+    proj = find_project(args.dir)
+    tasks, questions, adrs, specs = proj.tasks(), proj.questions(), proj.adrs(), proj.specs()
+    t = proj.get(args.slug, tasks)
+    print_show(proj, args.slug, tasks, questions)
+    files = [("task", t.path)]
+    files += [("architecture decision", adrs.get(a, a)) for a in t.meta.get("arch") or []]
+    files += [("spec", specs[x].path if x in specs else x) for x in t.meta.get("spec") or []]
+    files += [(f"question ({q.state})", q.path) for _, q in linked_questions(questions, args.slug)]
+    if args.review:
+        files += [(name, doc_path(proj, name)) for name in PROJECT_DOCS if os.path.isfile(doc_path(proj, name))]
+        files += [("dependent task", tasks[d].path) for d in Graph.from_tasks(tasks).dependents(args.slug)]
+    for kind, path in files:
+        print(f"\n=== {kind}: {os.path.relpath(path, proj.root) if os.path.isabs(path) else path + ' (missing)'}\n")
+        if os.path.isabs(path):
+            with open(path) as f:
+                print(f.read().rstrip())
+    if args.review:
+        print("\n=== review checks (sdd checks --task)\n")
+        print_checks(proj, [], args.slug)
+
+
+def cmd_ask(args):
+    check_slug(args.slug)
+    proj = find_project(args.dir)
+    tasks, questions, adrs = proj.tasks(), proj.questions(), proj.adrs()
+    if args.slug in questions:
+        raise Error(f"question {args.slug} already exists")
+    for s in [*args.task, *args.blocks]:
+        proj.get(s, tasks)
+    for a in args.arch:
+        if a not in adrs:
+            raise Error(f"unknown architecture decision: {a}")
+    proj.ensure_dirs()
+    path = os.path.join(proj.questions_dir, "open", f"{args.slug}.md")
+    with open(path, "w") as f:
+        f.write(QUESTION_TEMPLATE.format(title=args.title, tasks=", ".join(args.task), arch=", ".join(args.arch),
+                                         blocks=", ".join(args.blocks), date=today()))
+    print(path)
+
+
+def cmd_questions(args):
+    proj = find_project(args.dir)
+    questions = proj.questions()
+
+    def priority(item):
+        # Open first; among them, the ones holding back the most work, then the oldest.
+        slug, q = item
+        return (q.state != "open", -len(q.meta.get("blocks") or []), -len(q.meta.get("tasks") or []), q.meta.get("asked", ""), slug)
+
+    all_tasks = proj.tasks()
+    for slug, q in sorted(questions.items(), key=priority):
+        tasks, blocks = q.meta.get("tasks") or [], q.meta.get("blocks") or []
+        if (q.state != "open" or deferred(q, all_tasks)) and not args.all:
+            continue
+        if args.task and args.task not in tasks and args.task not in blocks:
+            continue
+        if args.arch and args.arch not in (q.meta.get("arch") or []):
+            continue
+        state = f"deferred until {','.join(q.meta['revisit'])}" if deferred(q, all_tasks) else q.state
+        print("\t".join([slug, state, q.meta.get("title", ""), ",".join(tasks), ",".join(blocks), q.meta.get("asked", "")]))
+
+
+def blockers(proj):
+    """Open questions holding up work right now: each blocks a startable task whose prerequisites
+    are all done, so the answer is the only thing in the way. Ranked by how much work waits behind
+    the tasks it blocks (them plus their transitive dependents), then oldest first."""
+    tasks, questions = proj.tasks(), proj.questions()
+    g = Graph.from_tasks(tasks)
+    open_count = sum(1 for q in questions.values() if q.state == "open" and not deferred(q, tasks))
+
+    rows = []
+    for slug, q in questions.items():
+        if q.state != "open" or deferred(q, tasks):
+            continue
+        waiting = sorted(s for s in q.meta.get("blocks") or []
+                         if s in tasks and tasks[s].state in STARTABLE and not unmet(g, s, tasks))
+        if waiting:
+            rows.append({"slug": slug, "title": q.meta.get("title", ""), "blocks": waiting,
+                         "downstream": len(downstream(g, waiting)), "asked": q.meta.get("asked", "")})
+    rows.sort(key=lambda r: (-r["downstream"], r["asked"], r["slug"]))
+    return {"open": open_count, "blockers": rows}
+
+
+def on_main(proj, fn):
+    """Runs `fn(Project)` on the data root as the remote main branch has it, in a throwaway
+    worktree, so a session sees what everyone else merged rather than a checkout that may be
+    behind. Local-mode data isn't in git: `fn` runs on the working copy."""
+    if proj.mode == "local":
+        return fn(proj)
+    repo = toplevel(proj.root)
+    rel = os.path.relpath(proj.root, repo)
+    base = default_branch(repo)
+    git("fetch", "-q", REMOTE, base, cwd=repo, check=False)
+    tmp = tempfile.mkdtemp(prefix="tasks-")
+    try:
+        git("worktree", "add", "--detach", "-q", tmp, f"{REMOTE}/{base}", cwd=repo)
+        return fn(Project(os.path.join(tmp, rel), proj.mode))
+    finally:
+        git("worktree", "remove", "--force", tmp, cwd=repo, check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_blockers(args):
+    result = blockers(find_project(args.dir))  # `--main` is handled for every read-only command in main()
+    if args.json:
+        print(json.dumps(result))
+        return
+    print(f"open: {result['open']}")
+    for r in result["blockers"]:
+        print("\t".join([r["slug"], r["title"], ",".join(r["blocks"]), str(r["downstream"]), r["asked"]]))
+
+
+def cmd_answer(args):
+    proj = find_project(args.dir)
+    q = proj.get_question(args.slug)
+    if q.state != "open":
+        raise Error(f"question {args.slug} is already answered")
+    if not sections(q.path).get("Answer"):
+        raise Error(f"{q.path}: write the answer under `## Answer` first")
+    set_meta(q.path, "answered", today())
+    print(proj.move(q.path, os.path.join(proj.questions_dir, "answered")))
+
+
+def check_review_checks(path):
+    """A reviewer reads checks from many files at once: each must be one bullet it can tick, and few enough to read."""
+    bullets, prose = review_checks(path)
+    out = []
+    if prose:
+        out.append(f"{path}: `## {CHECKS_SECTION}` has lines that aren't bullets; each check is one `- ` item a reviewer can verify")
+    if len(bullets) > CHECKS_MAX:
+        out.append(f"{path}: over {CHECKS_MAX} review checks; keep the ones a reviewer can't infer from the decision itself")
+    return out
+
+
+def cmd_validate(args):
+    proj = find_project(args.dir)
+    errors, warnings = [], []
+    seen, tasks = {}, {}
+    for slug, state, path, date in proj.task_files():
+        if slug in seen:
+            errors.append(f"duplicate task slug {slug}: {seen[slug]} and {path}")
+        seen[slug] = path
+        if not SLUG_RE.match(slug):
+            errors.append(f"invalid slug: {path}")
+        if date is not None and not DATE_RE.match(date):
+            errors.append(f"done directory is not a YYYY-MM-DD date: {os.path.dirname(path)}")
+        try:
+            meta = frontmatter(path)
+        except Error as e:
+            errors.append(str(e))
+            continue
+        if not meta.get("title"):
+            errors.append(f"{path}: missing title")
+        tasks[slug] = Task(state, path, date, meta)
+    for d in proj.state_dirs():
+        if not os.path.isfile(os.path.join(d, ".gitkeep")):
+            errors.append(f"missing {os.path.relpath(d, proj.root)}/.gitkeep (any mutating `sdd` command recreates it)")
+    g = Graph.from_tasks(tasks)
+    for slug, t in sorted(tasks.items()):
+        for p in t.meta.get("after") or []:
+            if p == slug:
+                errors.append(f"self-dependency: {slug}")
+            elif p not in tasks:
+                errors.append(f"{t.path}: unknown prerequisite {p}")
+    cycle = g.find_cycle()
+    if cycle:
+        errors.append("dependency cycle: " + " -> ".join(cycle))
+    adrs = proj.adrs()
+    adr_metas, specs = proj.adr_metas(), proj.specs()
+    data_repo = try_toplevel(proj.root)
+    base_ref = None
+    if data_repo and proj.mode == "shared":
+        base_ref = f"{REMOTE}/{default_branch(data_repo)}"
+        if git("rev-parse", "--verify", "--quiet", base_ref, cwd=data_repo, check=False).returncode != 0:
+            base_ref = None
+    for name, a in adr_metas.items():
+        if not ADR_RE.match(name + ".md"):
+            errors.append(f"architecture decision name is not YYYY-MM-DD-<slug>.md: {a.path}")
+        if a.legacy:
+            warnings.append(f"{a.path}: no frontmatter")
+            continue
+        status = a.meta.get("status", "")
+        if status not in ADR_STATUSES:
+            errors.append(f"{a.path}: status must be one of {', '.join(ADR_STATUSES)}, got {status!r}")
+        if not a.meta.get("areas"):
+            warnings.append(f"{a.path}: no areas, so `sdd context` can't find it by area")
+        for key in ("supersedes", "amends", "superseded-by", "amended-by"):
+            for ref in a.meta.get(key) or []:
+                if ref not in adrs:
+                    errors.append(f"{a.path}: unknown architecture decision {ref} in {key}")
+        with open(a.path) as f:
+            text = f.read()
+        if len(text.splitlines()) > ADR_MAX_LINES:
+            warnings.append(f"{a.path}: over {ADR_MAX_LINES} lines; an ADR records a decision, a description of how things are belongs in a spec (`sdd spec`)")
+        if status != "proposed" and not sections(a.path).get("Alternatives considered"):
+            warnings.append(f"{a.path}: no alternatives considered; a decision with no alternatives reads as a spec, or wasn't one")
+        warnings += check_review_checks(a.path)
+        if base_ref and status != "proposed":
+            # Once accepted, an ADR is history: only its frontmatter and errata may change.
+            rel = os.path.relpath(a.path, data_repo)
+            r = git("show", f"{base_ref}:{rel}", cwd=data_repo, check=False)
+            if r.returncode == 0:
+                old_meta, _ = parse_frontmatter(r.stdout), None
+                if old_meta is not None and old_meta.get("status") != "proposed" and adr_body(r.stdout) != adr_body(text):
+                    errors.append(f"{a.path}: body changed since {base_ref}; an accepted ADR only takes frontmatter and `## Errata` edits, a changed decision is a new ADR")
+    for name, s in specs.items():
+        if not SLUG_RE.match(name):
+            errors.append(f"invalid spec slug: {s.path}")
+        if not s.meta.get("title"):
+            errors.append(f"{s.path}: missing title")
+        if not s.meta.get("areas"):
+            warnings.append(f"{s.path}: no areas, so `sdd context` can't find it by area")
+        for a in s.meta.get("arch") or []:
+            if a not in adrs:
+                errors.append(f"{s.path}: unknown architecture decision {a}")
+        warnings += check_review_checks(s.path)
+    for slug, t in sorted(tasks.items()):
+        for a in t.meta.get("arch") or []:
+            if a not in adrs:
+                errors.append(f"{t.path}: unknown architecture decision {a}")
+        for s in t.meta.get("spec") or []:
+            if s not in specs:
+                errors.append(f"{t.path}: unknown spec {s}")
+        if t.state in ("in-progress", "done"):
+            blockers = [p for p in unmet(g, slug, tasks) if p in tasks]
+            if blockers:
+                warnings.append(f"{slug} is {t.state} but prerequisites aren't done: {', '.join(blockers)}")
+    seen, questions = {}, {}
+    for slug, state, path in proj.question_files():
+        if slug in seen:
+            errors.append(f"duplicate question slug {slug}: {seen[slug]} and {path}")
+        seen[slug] = path
+        if not SLUG_RE.match(slug):
+            errors.append(f"invalid slug: {path}")
+        try:
+            meta = frontmatter(path)
+        except Error as e:
+            errors.append(str(e))
+            continue
+        questions[slug] = Question(state, path, meta)
+        body = sections(path)
+        # A question is read long after the conversation that raised it, so it must stand alone.
+        for name in ("Question", "Context"):
+            if not body.get(name):
+                errors.append(f"{path}: empty `## {name}` section")
+        if state == "answered" and not body.get("Answer"):
+            errors.append(f"{path}: answered without an `## Answer`")
+        if state == "open" and body.get("Answer"):
+            warnings.append(f"{path}: has an answer but is still open (run `sdd answer {slug}`)")
+        for key in ("tasks", "blocks", "revisit"):
+            for s in meta.get(key) or []:
+                if s not in tasks:
+                    errors.append(f"{path}: unknown task {s} in {key}")
+        for a in meta.get("arch") or []:
+            if a not in adrs:
+                errors.append(f"{path}: unknown architecture decision {a}")
+        if not meta.get("title"):
+            errors.append(f"{path}: missing title")
+        if not (meta.get("tasks") or meta.get("arch")):
+            warnings.append(f"{path}: links to no task or architecture decision, so nobody will find it from there")
+    for slug, t in sorted(tasks.items()):
+        if t.state in ("in-progress", "done"):
+            blocking = open_blockers(questions, slug)
+            if blocking:
+                warnings.append(f"{slug} is {t.state} but blocked by open questions: {', '.join(blocking)}")
+    if proj.mode == "shared" and not args.dir:
+        # The section in the agent file is a copy of this CLI's template, so repos fall behind upgrades.
+        repo = toplevel()
+        marker, marker_file = read_marker(repo)
+        if marker_file:
+            with open(os.path.join(repo, marker_file)) as f:
+                content = f.read()
+            m = re.search(rf"{re.escape(SECTION_HEADER)}.*?{re.escape(SECTION_FOOTER)}\n?", content, re.S)
+            if m and m.group(0) != format_section(marker):
+                warnings.append(f"{marker_file}: the task workflow section is from an older version (run `sdd init` to refresh it)")
+    for name in PROJECT_DOCS:
+        status, issues = doc_status(proj, name)
+        if status == "missing":
+            warnings.append(f"no {PROJECT_DOCS[name][0]}: planning sessions won't know the project's {name} (`sdd doc new {name}`)")
+        for issue in issues:
+            errors.append(f"{doc_path(proj, name)}: {issue}")
+    for w in warnings:
+        print(f"warning: {w}")
+    for e in errors:
+        print(f"error: {e}")
+    if not errors:
+        open_q = sum(1 for q in questions.values() if q.state == "open")
+        print(f"ok: {len(tasks)} tasks, {len(g.edges)} dependencies, {len(adrs)} architecture decisions, {open_q} open questions")
+    return 1 if errors else 0
+
+
+def cmd_render(args):
+    proj = find_project(args.dir)
+    tasks = proj.tasks()
+    g = Graph.from_tasks(tasks)
+    styles = {
+        "todo": "",
+        "tech-debt": ' style=dashed',
+        "in-progress": ' style=filled fillcolor="#ffe08a"',
+        "done": ' style=filled fillcolor="#d9d9d9" fontcolor="#666666"',
+    }
+    hidden = {s for s, t in tasks.items() if t.state == "done"} if args.hide_done else set()
+    print("digraph tasks {\n  rankdir=LR;\n  node [shape=box];")
+    for n in sorted(g.nodes - hidden):
+        state = tasks[n].state if n in tasks else "missing"
+        print(f'  "{n}" [label="{n}\\n({state})"{styles.get(state, " color=red")}];')
+    for a, b in sorted(g.edges):
+        if a not in hidden and b not in hidden:
+            print(f'  "{a}" -> "{b}";')
+    print("}")
+
+
+def move_or_lost(proj, path, dest_dir, slug):
+    try:
+        return proj.move(path, dest_dir)
+    except FileNotFoundError:
+        raise Error(f"{slug} was moved by someone else meanwhile") from None
+
+
+def cmd_start(args):
+    proj = find_project(args.dir)
+
+    def claim(p, repo):
+        tasks = p.tasks()
+        t = p.get(args.slug, tasks)
+        if t.state not in STARTABLE:
+            raise Error(f"{args.slug} is {t.state}, not todo/tech-debt (already claimed?)")
+        blockers = not_ready(Graph.from_tasks(tasks), args.slug, tasks, p.questions())
+        if blockers:
+            raise Error(f"{args.slug} is waiting on: {', '.join(blockers)}")
+        dest = move_or_lost(p, t.path, os.path.join(p.tasks_dir, "in-progress"), args.slug)
+        set_meta(dest, "claimed", claim_stamp(repo))
+
+    if args.merge and args.no_pr:
+        raise Error("--merge needs the claim PR; drop --no-pr")
+    if args.branch:
+        if proj.mode == "shared" and not args.merge:
+            raise Error("--branch needs the claim on main first: add --merge, or branch once the claim PR has merged")
+        code_repo = toplevel()
+        if git("status", "--porcelain", cwd=code_repo).stdout.strip():
+            raise Error(f"{code_repo} has uncommitted changes; commit or stash them before `--branch` switches branches")
+    if proj.mode == "local":
+        claim(proj, None)
+        print(f"claimed {args.slug}")
+    else:
+        body = (f"Claims task `{args.slug}` by moving it to in-progress. Merge it before the implementation PR (branch `{args.slug}`) starts.\n\n"
+                "If it conflicts with main, someone else claimed the task first: close this PR.")
+        out = open_pr(proj, f"claim/{args.slug}", f"Claim task {args.slug}", body, claim, not args.no_pr)
+        print(out)
+        if args.merge:
+            merge_pr(out, toplevel(proj.root))
+            print(f"merged {out}")
+    if args.branch:
+        start_branch(code_repo, args.slug)
+
+
+def start_branch(repo, slug):
+    """Creates and switches to the task's branch from the remote main branch (or the local one when there is no remote)."""
+    base = default_branch(repo)
+    start = f"{REMOTE}/{base}" if git("fetch", "-q", REMOTE, base, cwd=repo, check=False).returncode == 0 else base
+    git("switch", "-q", "-c", slug, start, cwd=repo)
+    print(f"on branch {slug} from {start}")
+
+
+def cmd_ship(args):
+    """Ships the uncommitted changes under the data root (a plan, an answer) as one PR against main, from a
+    throwaway worktree, so the checkout's branch and other changes stay as they are. With `--merge`, merges
+    it and drops the now-redundant local changes."""
+    proj = find_project(args.dir)
+    if proj.mode == "local":
+        raise Error("local mode: the data isn't in a git repo, there is nothing to ship")
+    if args.merge and args.no_pr:
+        raise Error("--merge needs the PR; drop --no-pr")
+    repo = toplevel(proj.root)
+    rel = os.path.relpath(proj.root, repo)
+    changes = porcelain(repo, rel)
+    if not changes:
+        raise Error(f"no uncommitted changes under {rel}")
+
+    def apply(p, _repo):
+        tmp = os.path.normpath(os.path.join(p.root, os.path.relpath(repo, proj.root)))
+        for _, path in changes:
+            src, dst = os.path.join(repo, path), os.path.join(tmp, path)
+            if os.path.isfile(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            elif os.path.lexists(dst):
+                os.remove(dst)
+        r = subprocess.run([sys.executable, os.path.realpath(__file__), "--dir", p.root, "validate"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Error(f"not shipped, `sdd validate` fails on the result:\n{r.stdout.strip()}{r.stderr.strip()}")
+
+    out = open_pr(proj, args.branch or f"ship/{slugify(args.title)}", args.title, args.body or "", apply, not args.no_pr)
+    print(out)
+    if args.merge:
+        merge_pr(out, repo)
+        print(f"merged {out}")
+        base = default_branch(repo)
+        git("fetch", "-q", REMOTE, base, cwd=repo)
+        sync_with_main(repo, base, rel)
+
+
+def cmd_release(args):
+    proj = find_project(args.dir)
+
+    def release(p, repo):
+        t = p.get(args.slug)
+        if t.state != "in-progress":
+            raise Error(f"{args.slug} is {t.state}, not in-progress")
+        dest = move_or_lost(p, t.path, os.path.join(p.tasks_dir, "tech-debt" if args.tech_debt else "todo"), args.slug)
+        set_meta(dest, "claimed", None)
+
+    if proj.mode == "local":
+        release(proj, None)
+        print(f"released {args.slug}")
+        return
+    body = f"Releases task `{args.slug}` so someone else can pick it up."
+    print(open_pr(proj, f"release/{args.slug}", f"Release task {args.slug}", body, release, not args.no_pr))
+
+
+def cmd_done(args):
+    proj = find_project(args.dir)
+
+    def finish(p, repo):
+        t = p.get(args.slug)
+        if t.state != "in-progress":
+            raise Error(f"{args.slug} is {t.state}, not in-progress")
+        return move_or_lost(p, t.path, os.path.join(p.tasks_dir, "done", today()), args.slug)
+
+    # When the data lives in the code repo, the move rides along in the implementation PR. In a
+    # separate data repo it can't, so it becomes its own PR there once the code has merged.
+    if proj.mode == "local" or toplevel(proj.root) == try_toplevel():
+        print(finish(proj, None))
+        return
+    body = f"Marks task `{args.slug}` done; its implementation PR (branch `{args.slug}`) has merged."
+    print(open_pr(proj, f"done/{args.slug}", f"Finish task {args.slug}", body, finish, not args.no_pr))
+
+
+READ_ONLY = (cmd_ready, cmd_show, cmd_brief, cmd_list, cmd_context, cmd_checks, cmd_adrs, cmd_areas,
+             cmd_questions, cmd_blockers, cmd_validate, cmd_render, cmd_doc)
+
+
+def run_command(args):
+    if not getattr(args, "main", False):
+        return args.fn(args)
+    # `--main` runs a read-only command against a throwaway worktree of the remote main branch, so a
+    # session can see what everyone merged without syncing its own checkout first.
+    if args.fn not in READ_ONLY or (args.fn is cmd_doc and args.action == "new"):
+        raise Error("--main is for read-only commands (ready, show, brief, list, context, checks, questions, blockers, validate, ...)")
+    proj = find_project(args.dir)
+    if proj.mode == "local":
+        raise Error("local mode: the data isn't shared, there is no main to read")
+
+    def on_main_root(p):
+        args.dir = p.root
+        return args.fn(args)
+
+    return on_main(proj, on_main_root)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="sdd", description=__doc__.split("\n")[0])
+    p.add_argument("--dir", metavar="PATH", help="use the data root at PATH instead of the repo's configuration")
+    p.add_argument("--main", action="store_true", help="read the data as the remote main branch has it, not this checkout (shared mode, read-only commands)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="set up the task workflow for this repo (with --dir: only create the layout there)")
+    s.add_argument("path", nargs="?", help="data root: relative to the repo root, or any path with --local (default: the current one, else docs)")
+    s.add_argument("--local", action="store_true", help="keep the data outside the repo, configured only in this clone's git config")
+    s.add_argument("--agent-file", choices=AGENT_FILES, help="which agent file gets the instructions section (default: the one that has it, else the first that exists, else AGENTS.md)")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("root", help="print the data root and mode; fails if the project isn't initialized")
+    s.set_defaults(fn=cmd_root)
+
+    s = sub.add_parser("stale", help="fetch and fail if the data root is behind main or has uncommitted changes (run before planning)")
+    s.add_argument("--fix", action="store_true", help="first drop uncommitted changes that already match main and fast-forward; changes that differ are kept")
+    s.set_defaults(fn=cmd_stale)
+
+    s = sub.add_parser("new", help="create a task in todo (or tech-debt)")
+    s.add_argument("slug")
+    s.add_argument("--title", required=True)
+    s.add_argument("--tech-debt", action="store_true")
+    s.add_argument("--after", nargs="+", default=[], metavar="PREREQ", help="tasks that must be done first")
+    s.add_argument("--arch", nargs="+", default=[], metavar="ADR", help="architecture decisions (file name without .md)")
+    s.add_argument("--spec", nargs="+", default=[], metavar="SPEC", help="specs it implements or changes")
+    s.set_defaults(fn=cmd_new)
+
+    s = sub.add_parser("adr", help="create an architecture decision record dated today")
+    s.add_argument("slug")
+    s.add_argument("--title", required=True)
+    s.add_argument("--areas", nargs="+", default=[], metavar="AREA", help="areas it belongs to, generic to specific with slashes (e.g. backend/auth)")
+    s.add_argument("--supersedes", nargs="+", default=[], metavar="ADR", help="decisions it replaces entirely; they get `superseded-by` and status superseded")
+    s.add_argument("--amends", nargs="+", default=[], metavar="ADR", help="decisions it changes in part; they get `amended-by` and otherwise stand")
+    s.set_defaults(fn=cmd_adr)
+
+    s = sub.add_parser("accept", help="mark proposed architecture decisions accepted (the plan is agreed)")
+    s.add_argument("adrs", nargs="+", metavar="ADR", help="file names without .md")
+    s.set_defaults(fn=cmd_accept)
+
+    s = sub.add_parser("adrs", help="list architecture decisions by how many tasks and specs reference them: name, status, refs, areas, title")
+    s.add_argument("--area", nargs="+", metavar="AREA", help="only ADRs in these areas (prefix match)")
+    s.set_defaults(fn=cmd_adrs)
+
+    s = sub.add_parser("spec", help="create a living spec in specs/: how something is, kept current by the PRs that change it")
+    s.add_argument("slug")
+    s.add_argument("--title", required=True)
+    s.add_argument("--areas", nargs="+", default=[], metavar="AREA")
+    s.add_argument("--arch", nargs="+", default=[], metavar="ADR", help="the decisions behind it")
+    s.set_defaults(fn=cmd_spec)
+
+    s = sub.add_parser("areas", help="list the areas in use by ADRs and specs, with counts")
+    s.set_defaults(fn=cmd_areas)
+
+    s = sub.add_parser("context", help="reading list for planning: foundation ADRs, ADRs and specs matching areas or keywords, and the tasks and questions on them")
+    s.add_argument("--area", nargs="+", default=[], metavar="AREA", help="areas the feature touches (prefix match)")
+    s.add_argument("--grep", nargs="+", default=[], metavar="WORD", help="words to look for in ADR and spec files")
+    s.set_defaults(fn=cmd_context)
+
+    s = sub.add_parser("checks", help="review checks from the `## Review checks` of ADRs and specs: all, or those in some areas or around a task")
+    s.add_argument("--area", nargs="+", default=[], metavar="AREA", help="areas the change touches (prefix match)")
+    s.add_argument("--task", metavar="SLUG", help="a task: the checks of its ADRs and specs, and of everything in their areas")
+    s.set_defaults(fn=cmd_checks)
+
+    s = sub.add_parser("link", help="add ADR or spec links to a task in any state (fixing history, not re-planning)")
+    s.add_argument("slug")
+    s.add_argument("--arch", nargs="+", default=[], metavar="ADR")
+    s.add_argument("--spec", nargs="+", default=[], metavar="SPEC")
+    s.set_defaults(fn=cmd_link)
+
+    s = sub.add_parser("dep", help="add or remove dependencies: TASK depends on PREREQs")
+    s.add_argument("action", choices=["add", "rm"])
+    s.add_argument("task")
+    s.add_argument("prereqs", nargs="+")
+    s.set_defaults(fn=cmd_dep)
+
+    s = sub.add_parser("rm", help="delete a todo/tech-debt task that nothing depends on")
+    s.add_argument("slug")
+    s.set_defaults(fn=cmd_rm)
+
+    s = sub.add_parser("list", help="list tasks: slug, state, title, claim")
+    s.add_argument("state", nargs="?", choices=[*OPEN_STATES, "done"])
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("ready", help="list todo/tech-debt tasks whose prerequisites are all done: slug, state, title, tasks waiting behind it")
+    s.set_defaults(fn=cmd_ready)
+
+    s = sub.add_parser("show", help="show a task's state, file, dependencies and architecture decisions")
+    s.add_argument("slug")
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("brief", help="print a task with its ADRs, specs and questions in full; --review adds goal, principles, dependents and review checks")
+    s.add_argument("slug")
+    s.add_argument("--review", action="store_true", help="what a reviewer reads: also the project docs, the dependents' task files and `sdd checks --task`")
+    s.set_defaults(fn=cmd_brief)
+
+    s = sub.add_parser("doc", help="project docs (goal, principles): new writes the template, list shows their status, check fails on drafts")
+    s.add_argument("action", choices=["new", "list", "check"])
+    s.add_argument("name", nargs="?", choices=list(PROJECT_DOCS))
+    s.add_argument("--force", action="store_true", help="with new: overwrite an existing doc")
+    s.set_defaults(fn=cmd_doc)
+
+    s = sub.add_parser("ask", help="record an open question, linked to the tasks and ADRs it concerns")
+    s.add_argument("slug")
+    s.add_argument("--title", required=True)
+    s.add_argument("--task", nargs="+", default=[], metavar="TASK", help="tasks the question came up in or concerns")
+    s.add_argument("--arch", nargs="+", default=[], metavar="ADR", help="architecture decisions it touches (file name without .md)")
+    s.add_argument("--blocks", nargs="+", default=[], metavar="TASK", help="tasks that can't start until it's answered")
+    s.set_defaults(fn=cmd_ask)
+
+    s = sub.add_parser("questions", help="list open questions by priority (most blocked tasks, most linked tasks, oldest): slug, state, title, tasks, blocked tasks, asked")
+    s.add_argument("--task", metavar="SLUG", help="only questions linked to or blocking this task")
+    s.add_argument("--arch", metavar="ADR", help="only questions touching this architecture decision")
+    s.add_argument("--all", action="store_true", help="include answered questions")
+    s.set_defaults(fn=cmd_questions)
+
+    s = sub.add_parser("blockers", help="open questions that are the only thing holding up a task: slug, title, blocked tasks, work waiting behind them, asked")
+    s.add_argument("--json", action="store_true", help="print {open, blockers: [{slug, title, blocks, downstream, asked}]}")
+    s.add_argument("--main", action="store_true", dest="main", help="same as the global --main, kept for callers that pass it here")
+    s.set_defaults(fn=cmd_blockers)
+
+    s = sub.add_parser("defer", help="hide an open question from the default list until the given tasks are done")
+    s.add_argument("slug")
+    s.add_argument("--until", nargs="+", required=True, metavar="TASK")
+    s.set_defaults(fn=cmd_defer)
+
+    s = sub.add_parser("answer", help="mark a question answered once its `## Answer` section is written")
+    s.add_argument("slug")
+    s.set_defaults(fn=cmd_answer)
+
+    s = sub.add_parser("validate", help="check task and question files: frontmatter, dependencies form a DAG, references exist")
+    s.set_defaults(fn=cmd_validate)
+
+    s = sub.add_parser("render", help="print the dependency graph as styled DOT (pipe to `dot -Tsvg`)")
+    s.add_argument("--hide-done", action="store_true")
+    s.set_defaults(fn=cmd_render)
+
+    s = sub.add_parser("start", help="claim a ready task: opens a claim PR against main (local mode: moves it directly)")
+    s.add_argument("slug")
+    s.add_argument("--no-pr", action="store_true", help="only push the claim branch, don't run `gh pr create`")
+    s.add_argument("--merge", action="store_true", help="merge the claim PR right away (`gh pr merge --squash --delete-branch`); fails if GitHub refuses")
+    s.add_argument("--branch", action="store_true", help="then create and switch to branch <slug> from the remote main in this checkout")
+    s.set_defaults(fn=cmd_start)
+
+    s = sub.add_parser("ship", help="commit the uncommitted changes under the data root on a branch from main and open a PR (planning, answers)")
+    s.add_argument("--title", required=True, help="the commit and PR title")
+    s.add_argument("--body", help="the PR description")
+    s.add_argument("--branch", metavar="NAME", help="branch name (default: ship/<title slug>)")
+    s.add_argument("--merge", action="store_true", help="merge it right away and drop the shipped changes from this checkout (they are on main)")
+    s.add_argument("--no-pr", action="store_true", help="only push the branch, don't run `gh pr create`")
+    s.set_defaults(fn=cmd_ship)
+
+    s = sub.add_parser("release", help="un-claim an in-progress task: opens a release PR (local mode: moves it directly)")
+    s.add_argument("slug")
+    s.add_argument("--tech-debt", action="store_true", help="move it to tech-debt instead of todo")
+    s.add_argument("--no-pr", action="store_true", help="only push the release branch, don't run `gh pr create`")
+    s.set_defaults(fn=cmd_release)
+
+    s = sub.add_parser("done", help="move an in-progress task to done/<today> (separate data repo: opens a PR there)")
+    s.add_argument("slug")
+    s.add_argument("--no-pr", action="store_true", help="only push the done branch, don't run `gh pr create`")
+    s.set_defaults(fn=cmd_done)
+
+    args = p.parse_args()
+    try:
+        sys.exit(run_command(args) or 0)
+    except Error as e:
+        print(f"sdd: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

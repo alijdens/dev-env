@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Renders AGENTS.md (resolving its {{AI_WORKFLOW_DOCS_DIR}} placeholder to this checkout's
-# docs/ dir) and symlinks the result, plus docs/ itself, into each selected tool's config dir.
+# Renders AGENTS.md and skills/ (resolving their {{AI_WORKFLOW_DOCS_DIR}} placeholder to this
+# checkout's docs/ dir) and symlinks the results, plus docs/ itself, into each selected tool's
+# config dir. Skills are linked one by one, so skills installed from elsewhere coexist with them.
 # Also adds bin/ to PATH in the shell rc files, so docs can reference its commands by name, and
-# installs git hooks that re-run `--refresh` after pulls and checkouts, so changes don't wait for
-# a manual re-install. For Claude Code it also offers to link the plugins under
+# installs git hooks that re-run `--refresh` after pulls and checkouts, so new or changed skills
+# don't wait for a manual re-install. For Claude Code it also offers to link the plugins under
 # plugins/claude-code/ (yes by default; `--no-plugins` skips the question).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RENDERED_DIR="$REPO_DIR/.rendered"
 RENDERED_AGENTS_MD="$RENDERED_DIR/AGENTS.md"
+RENDERED_SKILLS_DIR="$RENDERED_DIR/skills"
 CLAUDE_PLUGINS_INSTALL="$REPO_DIR/plugins/claude-code/install.sh"
 CLAUDE_PLUGINS_DIR="$REPO_DIR/plugins/claude-code"
 
@@ -21,11 +23,19 @@ TOOLS=(
 )
 
 render() {
-  local docs_dir
+  local tmp file docs_dir
   # Escape sed's replacement specials, so a checkout path with `#`, `&` or `\` renders verbatim.
   docs_dir="$(printf '%s' "$REPO_DIR/docs" | sed 's/[&#\\]/\\&/g')"
   mkdir -p "$RENDERED_DIR"
   sed "s#{{AI_WORKFLOW_DOCS_DIR}}#$docs_dir#g" "$REPO_DIR/AGENTS.md" > "$RENDERED_AGENTS_MD"
+
+  rm -rf "$RENDERED_SKILLS_DIR"
+  cp -r "$REPO_DIR/skills" "$RENDERED_SKILLS_DIR"
+  while IFS= read -r -d '' file; do
+    tmp="$(mktemp)"
+    sed "s#{{AI_WORKFLOW_DOCS_DIR}}#$docs_dir#g" "$file" > "$tmp"
+    mv "$tmp" "$file"
+  done < <(find "$RENDERED_SKILLS_DIR" -type f -name "*.md" -print0)
 }
 
 usage() {
@@ -118,6 +128,25 @@ add_bin_to_path() {
   done
 }
 
+link_skills() {
+  local dir="$1" skill dest
+  # Earlier versions linked the whole skills dir; it holds only our rendered copies, so drop it.
+  if [[ -L "$dir" && "$(readlink "$dir")" == "$RENDERED_SKILLS_DIR" ]]; then
+    rm "$dir"
+  fi
+  mkdir -p "$dir"
+  for skill in "$RENDERED_SKILLS_DIR"/*/; do
+    skill="${skill%/}"
+    link "$skill" "$dir/$(basename "$skill")"
+  done
+  for dest in "$dir"/*; do
+    if [[ -L "$dest" && "$(readlink "$dest")" == "$RENDERED_SKILLS_DIR/"* && ! -e "$dest" ]]; then
+      rm "$dest"
+      echo "  removed stale skill: $dest"
+    fi
+  done
+}
+
 install_git_hooks() {
   local marker="# dev-env:ai-workflow-refresh"
   local hooks_dir hook path
@@ -157,7 +186,7 @@ install_claude_plugins() {
     claude_plugins_installed && answer="y" || answer="n"
   elif [[ -z "$answer" ]]; then
     if [[ -t 0 ]]; then
-      read -r -p "Install the Claude Code plugins in plugins/claude-code (pending-items band)? [Y/n] " answer
+      read -r -p "Install the Claude Code plugins in plugins/claude-code (sdd-decisions band)? [Y/n] " answer
     fi
     answer="${answer:-y}"
   fi
@@ -186,6 +215,7 @@ for tool in ${selected[@]+"${selected[@]}"}; do
       mkdir -p "$dir"
       link "$RENDERED_AGENTS_MD" "$dir/$file"
       link "$REPO_DIR/docs" "$dir/docs"
+      link_skills "$dir/skills"
       if [[ "$name" == "claude" ]]; then
         install_claude_plugins
       fi
