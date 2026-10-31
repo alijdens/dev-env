@@ -19,3 +19,29 @@ A `parse_date` lib function used by a `ReportService`, exposed through a `/repor
 - `parse_date` tests: valid formats, invalid formats, timezones, boundaries.
 - `ReportService` tests: a valid date filters reports as expected; an invalid date surfaces the service's error. Don't re-test every date format.
 - `/reports` endpoint tests: a valid request returns the report; the service error maps to the right HTTP status. Don't re-test service logic.
+
+## Don't wait on real time
+
+Tests must not depend on real sleeps or wall-clock time: they are slow, and they fail under load for reasons unrelated to the code. Raising a timeout or adding a delay is never the fix for a flaky test.
+
+Make every wait deterministic instead:
+
+- **Time**: use fake timers or an injectable clock and advance it explicitly.
+- **Lazy or deferred work** (a lazy chunk, a background import): resolve it before the test starts, e.g. import the chunk before rendering.
+- **Async jobs** (submit a job and wait for it to finish): mock the job with an event or promise that the test completes immediately, and await that. A timeout on the await is fine, but only as a guard so a bug doesn't block the whole run, never as the thing the test waits on.
+
+### Example
+
+```python
+# Bad: waits for real time and fails when the machine is slow
+submit_job()
+time.sleep(2)
+assert job_done()
+
+# Good: the fake completes the job and signals it; the timeout only guards against hanging
+done = threading.Event()
+fake_queue.on_submit(lambda job: (job.finish(), done.set()))
+submit_job()
+assert done.wait(timeout=5)
+assert job_done()
+```
