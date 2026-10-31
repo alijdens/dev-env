@@ -12,13 +12,6 @@ usage() {
   echo "  Links the plugins under $PLUGINS_DIR into $SKILLS_DIR."
 }
 
-plugins() {
-  local manifest
-  for manifest in "$PLUGINS_DIR"/*/.claude-plugin/plugin.json; do
-    [[ -f "$manifest" ]] && dirname "$(dirname "$manifest")"
-  done
-}
-
 remove_stale() {
   local dest
   for dest in "$SKILLS_DIR"/*; do
@@ -45,7 +38,9 @@ esac
 
 mkdir -p "$SKILLS_DIR"
 remove_stale
-for plugin in $(plugins); do
+for manifest in "$PLUGINS_DIR"/*/.claude-plugin/plugin.json; do
+  [[ -f "$manifest" ]] || continue
+  plugin="$(dirname "$(dirname "$manifest")")"
   dest="$SKILLS_DIR/$(basename "$plugin")"
   if [[ -L "$dest" ]]; then
     if [[ "$(readlink "$dest")" == "$plugin" ]]; then

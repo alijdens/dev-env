@@ -121,7 +121,11 @@ add_bin_to_path() {
 install_git_hooks() {
   local marker="# dev-env:ai-workflow-refresh"
   local hooks_dir hook path
-  hooks_dir="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-path hooks)"
+  # Not fatal: a tarball copy or a git too old for --path-format still gets the tools installed.
+  if ! hooks_dir="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-path hooks 2>/dev/null)"; then
+    echo "  skipping git hooks: $REPO_DIR isn't a git checkout git can read" >&2
+    return
+  fi
   mkdir -p "$hooks_dir"
   # post-rewrite covers `git pull --rebase`, which doesn't run post-merge.
   for hook in post-merge post-checkout post-rewrite; do
