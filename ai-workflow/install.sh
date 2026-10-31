@@ -1,28 +1,40 @@
 #!/usr/bin/env bash
 # Renders AGENTS.md (resolving its {{AI_WORKFLOW_DOCS_DIR}} placeholder to this checkout's
 # docs/ dir) and symlinks the result, plus docs/ itself, into each selected tool's config dir.
-# Also adds bin/ to PATH in the shell rc files, so docs can reference its commands by name.
+# Also adds bin/ to PATH in the shell rc files, so docs can reference its commands by name, and
+# installs git hooks that re-run `--refresh` after pulls and checkouts, so changes don't wait for
+# a manual re-install. For Claude Code it also offers to link the plugins under
+# plugins/claude-code/ (yes by default; `--no-plugins` skips the question).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RENDERED_DIR="$REPO_DIR/.rendered"
 RENDERED_AGENTS_MD="$RENDERED_DIR/AGENTS.md"
+CLAUDE_PLUGINS_INSTALL="$REPO_DIR/plugins/claude-code/install.sh"
+CLAUDE_PLUGINS_DIR="$REPO_DIR/plugins/claude-code"
 
 # tool_name:target_dir:target_filename
 TOOLS=(
   "claude:$HOME/.claude:CLAUDE.md"
   "codex:$HOME/.codex:AGENTS.md"
+  "agents:$HOME/.agents:AGENTS.md"
 )
 
 render() {
+  local docs_dir
+  # Escape sed's replacement specials, so a checkout path with `#`, `&` or `\` renders verbatim.
+  docs_dir="$(printf '%s' "$REPO_DIR/docs" | sed 's/[&#\\]/\\&/g')"
   mkdir -p "$RENDERED_DIR"
-  sed "s#{{AI_WORKFLOW_DOCS_DIR}}#$REPO_DIR/docs#g" "$REPO_DIR/AGENTS.md" > "$RENDERED_AGENTS_MD"
+  sed "s#{{AI_WORKFLOW_DOCS_DIR}}#$docs_dir#g" "$REPO_DIR/AGENTS.md" > "$RENDERED_AGENTS_MD"
 }
 
 usage() {
-  echo "Usage: $0 [tool...]"
+  echo "Usage: $0 [--no-plugins] [tool...]"
+  echo "       $0 --refresh"
   echo "  Available tools: $(for t in "${TOOLS[@]}"; do echo -n "${t%%:*} "; done)"
   echo "  With no arguments, installs all of the above."
+  echo "  --refresh re-installs only the tools already installed (used by the git hooks)."
+  echo "  --no-plugins skips the Claude Code plugins question (plugins/claude-code/)."
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -30,10 +42,32 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ $# -eq 0 ]]; then
+plugins_answer=""
+if [[ "${1:-}" == "--no-plugins" ]]; then
+  plugins_answer="n"
+  shift
+fi
+
+refresh=0
+if [[ "${1:-}" == "--refresh" ]]; then
+  refresh=1
+  selected=()
+  for t in "${TOOLS[@]}"; do
+    rest="${t#*:}"
+    if [[ "$(readlink "${rest%%:*}/${rest#*:}" 2>/dev/null)" == "$RENDERED_AGENTS_MD" ]]; then
+      selected+=("${t%%:*}")
+    fi
+  done
+elif [[ $# -eq 0 ]]; then
   selected=($(for t in "${TOOLS[@]}"; do echo "${t%%:*}"; done))
 else
-  selected=("$@")
+  selected=()
+  for arg in "$@"; do
+    case "$arg" in
+      .agents|generic) selected+=("agents") ;;
+      *) selected+=("$arg") ;;
+    esac
+  done
 fi
 
 link() {
@@ -84,10 +118,58 @@ add_bin_to_path() {
   done
 }
 
+install_git_hooks() {
+  local marker="# dev-env:ai-workflow-refresh"
+  local hooks_dir hook path
+  hooks_dir="$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-path hooks)"
+  mkdir -p "$hooks_dir"
+  # post-rewrite covers `git pull --rebase`, which doesn't run post-merge.
+  for hook in post-merge post-checkout post-rewrite; do
+    path="$hooks_dir/$hook"
+    if [[ -e "$path" ]] && ! grep -qF "$marker" "$path"; then
+      echo "  skipping git hook $path: it already exists and isn't ours" >&2
+      continue
+    fi
+    printf '#!/bin/sh\n%s\nexec "%s/install.sh" --refresh >/dev/null\n' "$marker" "$REPO_DIR" > "$path"
+    chmod +x "$path"
+  done
+}
+
+# A plugin is installed when its link in ~/.claude/skills points into plugins/claude-code/.
+claude_plugins_installed() {
+  local dest
+  for dest in "$HOME/.claude/skills"/*; do
+    if [[ -L "$dest" && "$(readlink "$dest")" == "$CLAUDE_PLUGINS_DIR/"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_claude_plugins() {
+  local answer="$plugins_answer"
+  if [[ "$refresh" == "1" ]]; then
+    # Hooks run unattended: only keep what was already installed up to date.
+    claude_plugins_installed && answer="y" || answer="n"
+  elif [[ -z "$answer" ]]; then
+    if [[ -t 0 ]]; then
+      read -r -p "Install the Claude Code plugins in plugins/claude-code (pending-items band)? [Y/n] " answer
+    fi
+    answer="${answer:-y}"
+  fi
+  case "$answer" in
+    y|Y|yes|YES) echo "Installing Claude Code plugins..."; "$CLAUDE_PLUGINS_INSTALL" ;;
+    *) echo "Skipping Claude Code plugins ($CLAUDE_PLUGINS_INSTALL installs them later)." ;;
+  esac
+}
+
 render
 add_bin_to_path
+install_git_hooks
 
-for tool in "${selected[@]}"; do
+# The `+` expansion keeps an empty selection (e.g. `--refresh` with nothing installed) from
+# tripping `set -u` on bash 3.2 (macOS).
+for tool in ${selected[@]+"${selected[@]}"}; do
   found=""
   for entry in "${TOOLS[@]}"; do
     name="${entry%%:*}"
@@ -100,6 +182,9 @@ for tool in "${selected[@]}"; do
       mkdir -p "$dir"
       link "$RENDERED_AGENTS_MD" "$dir/$file"
       link "$REPO_DIR/docs" "$dir/docs"
+      if [[ "$name" == "claude" ]]; then
+        install_claude_plugins
+      fi
     fi
   done
   if [[ -z "$found" ]]; then
