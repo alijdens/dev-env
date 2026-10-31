@@ -7,6 +7,7 @@ Centralized, tool-agnostic instructions for AI coding assistants (Claude Code, C
 Everything installable lives in a feature under `features/`, one directory holding all its parts, so it's clear what belongs together and a feature is installed or removed as a whole:
 
 - [`features/core/`](features/core) — always installed. `AGENTS.md`, the general instructions installed as each tool's global config file; `docs/`, the docs it loads conditionally (`pull-requests.md`, `planning.md`, ...); `bin/pull-pr-description`; `shell/git-push-reminder.sh`, which reminds to update the PR description after a `git push`; and the [`pending-items`](features/core/plugins/claude-code/pending-items/README.md) Claude Code plugin.
+- [`features/sdd/`](features/sdd/README.md) — the spec-driven development task workflow: its skills, docs, `sdd` CLI, `sdd-decisions` plugin and tests.
 
 A feature's parts are found by name, and all are optional:
 
