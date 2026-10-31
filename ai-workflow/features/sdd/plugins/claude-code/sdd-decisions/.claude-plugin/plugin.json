@@ -1,0 +1,6 @@
+{
+  "name": "sdd-decisions",
+  "version": "0.1.0",
+  "description": "A band above the prompt with the task workflow's open questions and the decisions that alone hold up a task.",
+  "types": "./types/index.d.ts"
+}
