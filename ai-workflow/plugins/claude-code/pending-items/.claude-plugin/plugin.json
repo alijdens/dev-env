@@ -1,0 +1,6 @@
+{
+  "name": "pending-items",
+  "version": "0.1.0",
+  "description": "A band above the prompt with the decisions and approvals the model is still waiting on from you, so they don't get lost in a long chat.",
+  "types": "./types/index.d.ts"
+}
