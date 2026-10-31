@@ -37,6 +37,12 @@ Content rules that apply at every size:
 - **Don't restate the diff.** A file-by-file list of edits adds nothing; describe components and responsibilities only when the change spans enough of them that the diff alone doesn't show how they fit.
 - **Key decisions are for choices a reviewer might question.** Skip trivia (e.g. "the import stays because it's still used") and justifications for not doing things nobody would expect.
 
+### Showing user-facing changes
+
+When the change is something a user sees (a page, a component, a CLI's output, a rendered document) and a picture says more than a paragraph, show it: run the change and capture a screenshot, or a short recording for an interaction or an animation, and put it in the description, before/after for a change to something that already existed. Use whatever browser tooling the session has (a browser automation tool or extension that can open the running app and take screenshots or GIF recordings); start the app the way the repo's docs say and capture the real feature, not a mock. Crop to the relevant part and make sure no personal or private data is in the frame.
+
+Skip it when the change isn't visible or an image adds nothing (a copy tweak the title already states, a change with no observable difference). If no browser tooling is available or the app can't be run in the session, leave a clearly marked placeholder for the author instead of describing what the screenshot would show.
+
 ### Formatting rules
 
 - Use fenced code blocks for examples (with a language) and `mermaid` blocks for diagrams.
@@ -52,7 +58,7 @@ Pick the structure matching what the PR is; for mixed PRs, lead with the dominan
 1. **Feature overview** — a short summary of what the change adds: the problem first, then the one-line shape of the solution. No implementation detail here.
 2. **Usage example** — how the feature is used, from the consumer's side:
    - For a code/API surface (lib function, endpoint, CLI, config): the smallest snippet a consumer would write, plus the observable runtime behavior (inputs, outputs, notable states).
-   - For UI: a screenshot or short recording (before/after when it's a change). If you can't capture one, leave a placeholder for the author to fill in.
+   - For UI: a screenshot or short recording (before/after when it's a change). See "Showing user-facing changes" below.
    - Skip it for internal changes with no consumer-facing surface.
 3. **Implementation details** — only when the change spans several components; a layered, outside-in explanation of how the data flows:
    - A `mermaid` **data-flow** chart only when the path crosses several boundaries non-obviously (entry point → transport/persistence → runtime → effect). Never for a linear chain of two or three nodes.

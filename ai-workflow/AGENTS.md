@@ -29,6 +29,8 @@ If a task can't be fulfilled because something looks like an error, stop — don
 
 When asked to commit or create a PR, read `{{AI_WORKFLOW_DOCS_DIR}}/pull-requests.md` first and follow it. Don't load it otherwise.
 
+Never merge pull requests unless the user explicitly authorizes it, even if this blocks you.
+
 ## Testing
 
 When writing or planning tests, read `{{AI_WORKFLOW_DOCS_DIR}}/testing.md` first and follow it. Don't load it otherwise.
