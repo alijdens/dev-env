@@ -84,3 +84,85 @@ test('a merge in the session refreshes the band', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
   await ui.unmount()
 })
+
+function fakeSdd(pending: { value: string }, dirs: (string | undefined)[] = []) {
+  return (_: unknown, e: { argv: readonly string[] }) => {
+    if (e.argv.includes('blockers')) return stdout(JSON.stringify(REPORT))
+    const at = e.argv.indexOf('--dir')
+    dirs.push(at === -1 ? undefined : e.argv[at + 1])
+    return stdout(pending.value)
+  }
+}
+
+const THREE = 'ttl\topen\tHow long?\t\t\t2026-10-29\nauth\topen\tWhich provider?\t\t\t2026-10-29\nlogs\topen\tKeep logs?\t\t\t2026-10-29\n'
+
+async function bandText($: any, surface: 'terminal' | 'desktop' = 'terminal') {
+  const ui = await $.ui.mount({ ...BAND, surface })
+  const row = await ui.find({ type: 'Text', text: /question|pending/ })
+  await ui.unmount()
+  return row?.text
+}
+
+async function startAnswering($: any, on: any, pending: { value: string }, dirs?: (string | undefined)[]) {
+  const clock = mock.clock(on)
+  on('process.run', fakeSdd(pending, dirs))
+  on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('tool.call', () => ({ result: {} }))
+  on('skill.prompt', (_: unknown, e: { text: string }) => ({ text: e.text }))
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.skill.prompt({ skill: 'sdd-answer-questions', text: 'walk' })
+  await clock.settle()
+  return clock
+}
+
+test('the skill swaps the band for its progress, following the question it reads', async ($, on) => {
+  const clock = await startAnswering($, on, { value: THREE })
+  expect(await bandText($)).toBe('Answering open questions, 3 pending')
+
+  await $.tool.call({ tool: 'Read', file_path: '/w/tasks/questions/open/auth.md' })
+  await clock.settle()
+  expect(await bandText($)).toBe('Answering question: Which provider?, 2 more pending')
+
+  await $.tool.call({ tool: 'Bash', command: 'sed -n 1,40p tasks/questions/open/logs.md 2>/dev/null' })
+  await clock.settle()
+  expect(await bandText($)).toBe('Answering question: Keep logs?, 2 more pending')
+})
+
+test('a question file being written is not the one under discussion', async ($, on) => {
+  const clock = await startAnswering($, on, { value: THREE })
+  await $.tool.call({ tool: 'Read', file_path: '/w/tasks/questions/open/auth.md' })
+  await $.tool.call({ tool: 'Bash', command: 'cat > tasks/questions/open/logs.md <<EOF' })
+  await clock.settle()
+  expect(await bandText($)).toBe('Answering question: Which provider?, 2 more pending')
+})
+
+test('closing a question recounts in the directory the skill works in', async ($, on) => {
+  const pending = { value: THREE }
+  const dirs: (string | undefined)[] = []
+  const clock = await startAnswering($, on, pending, dirs)
+  await $.tool.call({ tool: 'Read', file_path: '/w/tasks/questions/open/ttl.md' })
+
+  pending.value = THREE.split('\n').slice(1).join('\n')
+  await $.tool.call({ tool: 'Bash', command: 'cd /w && sdd --dir /w/tasks answer ttl' })
+  await clock.settle()
+  expect(dirs.at(-1)).toBe('/w/tasks')
+  expect(await bandText($)).toBe('Answering open questions, 2 pending')
+})
+
+test('the band returns when nothing is left to answer', async ($, on) => {
+  const pending = { value: 'ttl\topen\tHow long?\t\t\t2026-10-29\n' }
+  const clock = await startAnswering($, on, pending)
+  pending.value = ''
+  await $.tool.call({ tool: 'Bash', command: 'sdd answer ttl' })
+  await clock.settle()
+  expect(await bandText($)).toContain('3 open questions, /sdd-answer-questions to resolve')
+})
+
+test('the band returns after half an hour without touching a question', async ($, on) => {
+  const clock = await startAnswering($, on, { value: THREE })
+  await clock.advance(29 * 60_000)
+  expect(await bandText($)).toBe('Answering open questions, 3 pending')
+  await clock.advance(60_000)
+  await clock.settle()
+  expect(await bandText($)).toContain('3 open questions, /sdd-answer-questions to resolve')
+})
