@@ -27,21 +27,21 @@ Write an ADR only for decisions that are hard to reverse, span several component
 
 - `sdd adr <slug> --title "..." --areas <area>... [--amends <adr>...] [--supersedes <adr>...]` creates `arch/<today>-<slug>.md` with sections: Context, Decision, Alternatives considered, Consequences. Status starts as `proposed`; set it to `accepted` when the plan is agreed.
 - The title names the component and the decision ("Rate limits stored in Redis per API key"), not the feature ("Rate limiting"), since titles are what `sdd context` and readers scan.
-- Keep them short and durable (see `../documentation.md`): the problem, the decision, the rejected options and why, and what it costs. Under 100 lines; `sdd validate` warns past that.
+- Keep them short and durable (see `../documentation.md`): the problem, the decision, the rejected options and why, and what it costs. Under 100 lines; `sdd validate` warns past that while the ADR is proposed (once accepted the body is history, so the warning would never go away).
 - Once accepted, an ADR is history (see `overview.md`): a factual slip gets an Errata line, a changed decision gets a new ADR that `--amends` (part of it) or `--supersedes` (all of it) the old one. Don't edit or delete the old text.
 - When a decision gives reviewers something to verify on every later change in its areas that they couldn't infer from the decision itself (a test every migration needs, a file every endpoint must update), add it as a bullet under `## Review checks` (see `overview.md`). Most ADRs have none; a rule that would apply to every change is a principle to raise with the user, not a check.
 
 ## Tasks
 
-- One task is one reviewable PR that leaves main working (see the size target in `../pull-requests.md`). Split anything bigger.
-- `sdd new <slug> --title "..." [--after <prereq>...] [--arch <adr>...] [--tech-debt]` creates the file with its prerequisites and ADRs in the frontmatter. ADRs are referenced by file name without `.md` (e.g. `2026-10-12-rate-limit-strategy`).
+- One task is one reviewable PR that leaves main working. The size target in `../pull-requests.md` is met here, by splitting tasks: an implementer doesn't split a task into a stack, so a task planned too big becomes a PR too big.
+- `sdd new <slug> --title "..." [--after <prereq>...] [--arch <adr>...] [--tech-debt] [--needs user|secret|...]` creates the file with its prerequisites and ADRs in the frontmatter. ADRs are referenced by file name without `.md` (e.g. `2026-10-12-rate-limit-strategy`). `--needs` marks a task an agent can't do alone (a live run against a real account, a credential only the user has): `sdd ready` shows it and orchestrated runs leave it to the user.
 - Fill in the template: **Goal** (what and why, in a few lines), **Acceptance criteria** (verifiable), **Notes** (constraints, pointers into the code, anything an implementer needs that isn't in the ADRs). A task plus its ADRs and specs must be enough context to implement it without the planning conversation.
 - `arch:` lists every ADR that constrains the task, including older ones the plan didn't write, and `--spec` every spec it implements or changes; a worker reads only what's linked. The Notes name what each prerequisite delivered that the task builds on (the interface, where the code is), or point at the done task.
 - `sdd rm <slug>` deletes a planned task nothing depends on.
 
 ## Dependencies
 
-- Add a dependency only when a task genuinely can't start without another one being merged (it needs its code, schema or interface). Preferred ordering is not a dependency: every extra edge reduces how much can run in parallel.
+- Add a dependency only when a task genuinely can't start without another one being merged (it needs its code, schema or interface). Preferred ordering is not a dependency: every extra edge reduces how much can run in parallel. But a required order is one: "run the smoke test before its dependents start" is `after:` on the dependents, never a sentence in Notes, which a worker reads only after claiming and an orchestrator never does.
 - `sdd dep add <task> <prereq>...` / `sdd dep rm <task> <prereq>...` edit the task's `after:` list. The CLI rejects cycles.
 
 ## Open questions

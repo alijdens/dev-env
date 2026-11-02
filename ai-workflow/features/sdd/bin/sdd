@@ -49,7 +49,7 @@ ADR_MAX_LINES = 100
 CHECKS_SECTION = "Review checks"
 CHECKS_MAX = 10
 AGENT_FILES = ("AGENTS.md", "CLAUDE.md")
-LIST_KEYS = ("after", "arch", "spec", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by")
+LIST_KEYS = ("after", "arch", "spec", "needs", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by")
 LEGACY_STATUS_RE = re.compile(r"^- Status:\s*(.+?)\s*$", re.M)
 LEGACY_DATE_RE = re.compile(r"^- Date:\s*(\S+)\s*$", re.M)
 LOCAL_KEY = "sdd.root"
@@ -866,6 +866,8 @@ def cmd_new(args):
         f.write(TASK_TEMPLATE.format(title=args.title, after=", ".join(args.after), arch=", ".join(args.arch)))
     if args.spec:
         set_meta(path, "spec", args.spec)
+    if args.needs:
+        set_meta(path, "needs", args.needs)
     print(path)
 
 
@@ -1011,21 +1013,67 @@ def print_checks(proj, wanted_areas, task):
             print("  " + b.replace("\n", "\n  "))
 
 
+def add_links(path, meta, key, new):
+    if new:
+        current = list(meta.get(key) or [])
+        set_meta(path, key, current + [x for x in new if x not in current])
+
+
 def cmd_link(args):
-    """Adds ADR or spec links to a task in any state: a missing link is a fact about history, not a re-plan."""
+    """Adds links to a task (ADRs, specs), a question (tasks, blocked tasks, ADRs) or an ADR (amends,
+    supersedes) in any state: a missing link is a fact about history, not a re-plan, and the
+    alternative is editing frontmatter by hand."""
     proj = find_project(args.dir)
-    t = proj.get(args.slug)
-    adrs, specs = proj.adrs(), proj.specs()
-    for a in args.arch:
+    tasks, questions, adrs, specs = proj.tasks(), proj.questions(), proj.adr_metas(), proj.specs()
+    kinds = [k for k, found in (("task", args.slug in tasks), ("question", args.slug in questions), ("adr", args.slug in adrs)) if found]
+    if args.as_ and args.as_ not in kinds:
+        raise Error(f"unknown {args.as_}: {args.slug}")
+    if not kinds:
+        raise Error(f"unknown task, question or architecture decision: {args.slug}")
+    if len(kinds) > 1 and not args.as_:
+        raise Error(f"{args.slug} is both a {' and a '.join(kinds)}; pass --as {'|'.join(kinds)}")
+    kind = args.as_ or kinds[0]
+    allowed = {"task": ("arch", "spec"), "question": ("task", "blocks", "arch"), "adr": ("amends", "supersedes")}[kind]
+    given = [k for k in ("arch", "spec", "task", "blocks", "amends", "supersedes") if getattr(args, k)]
+    if not given:
+        raise Error("nothing to link")
+    for k in given:
+        if k not in allowed:
+            raise Error(f"--{k} doesn't apply to a {kind}; a {kind} takes {', '.join('--' + x for x in allowed)}")
+    for a in [*args.arch, *args.amends, *args.supersedes]:
         if a not in adrs:
             raise Error(f"unknown architecture decision: {a}")
-    for s in args.spec:
-        if s not in specs:
-            raise Error(f"unknown spec: {s}")
-    for key, new in (("arch", args.arch), ("spec", args.spec)):
-        if new:
-            current = list(t.meta.get(key) or [])
-            set_meta(t.path, key, current + [x for x in new if x not in current])
+    for x in args.spec:
+        if x not in specs:
+            raise Error(f"unknown spec: {x}")
+    for x in [*args.task, *args.blocks]:
+        proj.get(x, tasks)
+    if kind == "task":
+        t = tasks[args.slug]
+        add_links(t.path, t.meta, "arch", args.arch)
+        add_links(t.path, t.meta, "spec", args.spec)
+    elif kind == "question":
+        q = questions[args.slug]
+        add_links(q.path, q.meta, "tasks", args.task)
+        add_links(q.path, q.meta, "blocks", args.blocks)
+        add_links(q.path, q.meta, "arch", args.arch)
+    else:
+        a = adrs[args.slug]
+        if a.legacy:
+            raise Error(f"{a.path} has no frontmatter to record links in")
+        for key, back in (("supersedes", "superseded-by"), ("amends", "amended-by")):
+            olds = getattr(args, key)
+            if args.slug in olds:
+                raise Error(f"{args.slug} can't {key[:-1]} itself")
+            for old in olds:
+                if adrs[old].legacy:
+                    raise Error(f"{adrs[old].path} has no frontmatter to record `{back}` in")
+            add_links(a.path, a.meta, key, olds)
+            # Only frontmatter changes on either side: an accepted ADR's body stays history.
+            for old in olds:
+                add_links(adrs[old].path, adrs[old].meta, back, [args.slug])
+                if key == "supersedes" and adrs[old].meta.get("status") != "superseded":
+                    set_meta(adrs[old].path, "status", "superseded")
 
 
 def cmd_defer(args):
@@ -1118,7 +1166,8 @@ def cmd_ready(args):
     # the next task can start the one that frees the most work.
     behind = {s: len(downstream(g, [s])) - 1 for s in ready}
     for slug in sorted(ready, key=lambda s: (-behind[s], s)):
-        print("\t".join([slug, tasks[slug].state, tasks[slug].meta.get("title", ""), str(behind[slug])]))
+        t = tasks[slug]
+        print("\t".join([slug, t.state, t.meta.get("title", ""), str(behind[slug]), ",".join(t.meta.get("needs") or [])]))
 
 
 def cmd_show(args):
@@ -1137,6 +1186,8 @@ def print_show(proj, slug, tasks, questions):
     print(f"slug: {slug}\nstate: {t.state}\ntitle: {t.meta.get('title', '')}\nfile: {t.path}")
     if t.meta.get("claimed"):
         print(f"claimed: {t.meta['claimed']}")
+    if t.meta.get("needs"):
+        print(f"needs: {', '.join(t.meta['needs'])}")
     state_of = lambda s: tasks[s].state if s in tasks else "missing"
     print("prereqs:" + "".join(f"\n  {p}\t{state_of(p)}" for p in g.prereqs(slug)))
     print("dependents:" + "".join(f"\n  {d}\t{state_of(d)}" for d in g.dependents(slug)))
@@ -1203,9 +1254,12 @@ def cmd_questions(args):
         return (q.state != "open", -len(q.meta.get("blocks") or []), -len(q.meta.get("tasks") or []), q.meta.get("asked", ""), slug)
 
     all_tasks = proj.tasks()
+    since = questions_added_since(proj, args.since) if args.since else None
     for slug, q in sorted(questions.items(), key=priority):
         tasks, blocks = q.meta.get("tasks") or [], q.meta.get("blocks") or []
         if (q.state != "open" or deferred(q, all_tasks)) and not args.all:
+            continue
+        if since is not None and slug not in since:
             continue
         if args.task and args.task not in tasks and args.task not in blocks:
             continue
@@ -1213,6 +1267,18 @@ def cmd_questions(args):
             continue
         state = f"deferred until {','.join(q.meta['revisit'])}" if deferred(q, all_tasks) else q.state
         print("\t".join([slug, state, q.meta.get("title", ""), ",".join(tasks), ",".join(blocks), q.meta.get("asked", "")]))
+
+
+def questions_added_since(proj, rev):
+    """Slugs of the questions whose file was added after `rev`, so a run can report what it raised."""
+    if proj.mode == "local":
+        raise Error("local mode: the data isn't in git, --since has no history to read")
+    repo = toplevel(proj.root)
+    rel = os.path.relpath(proj.questions_dir, repo)
+    r = git("diff", "--name-only", "--diff-filter=A", rev, "HEAD", "--", rel, cwd=repo, check=False)
+    if r.returncode != 0:
+        raise Error(f"git diff {rev}..HEAD failed:\n{r.stderr.strip()}")
+    return {os.path.basename(p)[:-3] for p in r.stdout.split() if p.endswith(".md")}
 
 
 def blockers(proj):
@@ -1227,10 +1293,12 @@ def blockers(proj):
     for slug, q in questions.items():
         if q.state != "open" or deferred(q, tasks):
             continue
+        # An in-progress task blocked by a question is work already built, held for the answer.
         waiting = sorted(s for s in q.meta.get("blocks") or []
-                         if s in tasks and tasks[s].state in STARTABLE and not unmet(g, s, tasks))
+                         if s in tasks and (tasks[s].state == "in-progress" or tasks[s].state in STARTABLE and not unmet(g, s, tasks)))
         if waiting:
             rows.append({"slug": slug, "title": q.meta.get("title", ""), "blocks": waiting,
+                         "held": [s for s in waiting if tasks[s].state == "in-progress"],
                          "downstream": len(downstream(g, waiting)), "asked": q.meta.get("asked", "")})
     rows.sort(key=lambda r: (-r["downstream"], r["asked"], r["slug"]))
     return {"open": open_count, "blockers": rows}
@@ -1260,9 +1328,13 @@ def cmd_blockers(args):
     if args.json:
         print(json.dumps(result))
         return
+    if not result["blockers"]:
+        print(f"no question alone blocks a task ({result['open']} open)")
+        return
     print(f"open: {result['open']}")
     for r in result["blockers"]:
-        print("\t".join([r["slug"], r["title"], ",".join(r["blocks"]), str(r["downstream"]), r["asked"]]))
+        blocks = ",".join(s + (" (in-progress)" if s in r["held"] else "") for s in r["blocks"])
+        print("\t".join([r["slug"], r["title"], blocks, str(r["downstream"]), r["asked"]]))
 
 
 def cmd_answer(args):
@@ -1345,7 +1417,8 @@ def cmd_validate(args):
                     errors.append(f"{a.path}: unknown architecture decision {ref} in {key}")
         with open(a.path) as f:
             text = f.read()
-        if len(text.splitlines()) > ADR_MAX_LINES:
+        # Once accepted the body is history and can't be shortened, so the warning would never go away.
+        if status == "proposed" and len(text.splitlines()) > ADR_MAX_LINES:
             warnings.append(f"{a.path}: over {ADR_MAX_LINES} lines; an ADR records a decision, a description of how things are belongs in a spec (`sdd spec`)")
         if status != "proposed" and not sections(a.path).get("Alternatives considered"):
             warnings.append(f"{a.path}: no alternatives considered; a decision with no alternatives reads as a spec, or wasn't one")
@@ -1413,11 +1486,12 @@ def cmd_validate(args):
             errors.append(f"{path}: missing title")
         if not (meta.get("tasks") or meta.get("arch")):
             warnings.append(f"{path}: links to no task or architecture decision, so nobody will find it from there")
+    # An in-progress task blocked by a question is held for a decision (`working.md`), not an error.
     for slug, t in sorted(tasks.items()):
-        if t.state in ("in-progress", "done"):
+        if t.state == "done":
             blocking = open_blockers(questions, slug)
             if blocking:
-                warnings.append(f"{slug} is {t.state} but blocked by open questions: {', '.join(blocking)}")
+                warnings.append(f"{slug} is done but blocked by open questions: {', '.join(blocking)}")
     if proj.mode == "shared" and not args.dir:
         # The section in the agent file is a copy of this CLI's template, so repos fall behind upgrades.
         repo = toplevel()
@@ -1506,13 +1580,32 @@ def cmd_start(args):
             merge_pr(out, toplevel(proj.root))
             print(f"merged {out}")
     if args.branch:
-        start_branch(code_repo, args.slug)
+        start_branch(code_repo, args.slug, proj if proj.mode == "shared" and toplevel(proj.root) == code_repo else None)
 
 
-def start_branch(repo, slug):
-    """Creates and switches to the task's branch from the remote main branch (or the local one when there is no remote)."""
+def start_branch(repo, slug, proj=None, attempts=3):
+    """Creates and switches to the task's branch from the remote main branch, or the local one when there is
+    no remote. A failed fetch is an error, not a reason to branch from a local main that may be behind.
+    With `proj` (the data lives in this repo), the base must already carry the claim."""
     base = default_branch(repo)
-    start = f"{REMOTE}/{base}" if git("fetch", "-q", REMOTE, base, cwd=repo, check=False).returncode == 0 else base
+    if git("remote", "get-url", REMOTE, cwd=repo, check=False).returncode != 0:
+        git("switch", "-q", "-c", slug, base, cwd=repo)
+        print(f"on branch {slug} from {base}")
+        return
+    start = f"{REMOTE}/{base}"
+    claim = os.path.join(os.path.relpath(proj.tasks_dir, repo), "in-progress", f"{slug}.md") if proj else None
+    for attempt in range(attempts):
+        # Parallel fetches of one repo (worktrees share its refs) can fail on a ref lock; a merge that just
+        # landed can take a moment to show up. Both are transient.
+        r = git("fetch", "-q", REMOTE, base, cwd=repo, check=False)
+        if r.returncode == 0 and (not claim or git("cat-file", "-e", f"{start}:{claim}", cwd=repo, check=False).returncode == 0):
+            break
+        if attempt < attempts - 1:
+            time.sleep(2)
+    else:
+        if r.returncode != 0:
+            raise Error(f"could not fetch {start}, not branching from a possibly stale {base}:\n{r.stderr.strip()}")
+        raise Error(f"{start} doesn't have the claim ({claim}); is the claim PR merged?")
     git("switch", "-q", "-c", slug, start, cwd=repo)
     print(f"on branch {slug} from {start}")
 
@@ -1636,17 +1729,18 @@ def main():
     s.add_argument("slug")
     s.add_argument("--title", required=True)
     s.add_argument("--tech-debt", action="store_true")
-    s.add_argument("--after", nargs="+", default=[], metavar="PREREQ", help="tasks that must be done first")
-    s.add_argument("--arch", nargs="+", default=[], metavar="ADR", help="architecture decisions (file name without .md)")
-    s.add_argument("--spec", nargs="+", default=[], metavar="SPEC", help="specs it implements or changes")
+    s.add_argument("--after", nargs="+", action="extend", default=[], metavar="PREREQ", help="tasks that must be done first")
+    s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR", help="architecture decisions (file name without .md)")
+    s.add_argument("--spec", nargs="+", action="extend", default=[], metavar="SPEC", help="specs it implements or changes")
+    s.add_argument("--needs", nargs="+", action="extend", default=[], metavar="WHAT", help="what an agent can't provide on its own (e.g. user, secret); `sdd ready` shows it and orchestrated runs skip the task")
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("adr", help="create an architecture decision record dated today")
     s.add_argument("slug")
     s.add_argument("--title", required=True)
-    s.add_argument("--areas", nargs="+", default=[], metavar="AREA", help="areas it belongs to, generic to specific with slashes (e.g. backend/auth)")
-    s.add_argument("--supersedes", nargs="+", default=[], metavar="ADR", help="decisions it replaces entirely; they get `superseded-by` and status superseded")
-    s.add_argument("--amends", nargs="+", default=[], metavar="ADR", help="decisions it changes in part; they get `amended-by` and otherwise stand")
+    s.add_argument("--areas", nargs="+", action="extend", default=[], metavar="AREA", help="areas it belongs to, generic to specific with slashes (e.g. backend/auth)")
+    s.add_argument("--supersedes", nargs="+", action="extend", default=[], metavar="ADR", help="decisions it replaces entirely; they get `superseded-by` and status superseded")
+    s.add_argument("--amends", nargs="+", action="extend", default=[], metavar="ADR", help="decisions it changes in part; they get `amended-by` and otherwise stand")
     s.set_defaults(fn=cmd_adr)
 
     s = sub.add_parser("accept", help="mark proposed architecture decisions accepted (the plan is agreed)")
@@ -1654,33 +1748,38 @@ def main():
     s.set_defaults(fn=cmd_accept)
 
     s = sub.add_parser("adrs", help="list architecture decisions by how many tasks and specs reference them: name, status, refs, areas, title")
-    s.add_argument("--area", nargs="+", metavar="AREA", help="only ADRs in these areas (prefix match)")
+    s.add_argument("--area", nargs="+", action="extend", metavar="AREA", help="only ADRs in these areas (prefix match)")
     s.set_defaults(fn=cmd_adrs)
 
     s = sub.add_parser("spec", help="create a living spec in specs/: how something is, kept current by the PRs that change it")
     s.add_argument("slug")
     s.add_argument("--title", required=True)
-    s.add_argument("--areas", nargs="+", default=[], metavar="AREA")
-    s.add_argument("--arch", nargs="+", default=[], metavar="ADR", help="the decisions behind it")
+    s.add_argument("--areas", nargs="+", action="extend", default=[], metavar="AREA")
+    s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR", help="the decisions behind it")
     s.set_defaults(fn=cmd_spec)
 
     s = sub.add_parser("areas", help="list the areas in use by ADRs and specs, with counts")
     s.set_defaults(fn=cmd_areas)
 
     s = sub.add_parser("context", help="reading list for planning: foundation ADRs, ADRs and specs matching areas or keywords, and the tasks and questions on them")
-    s.add_argument("--area", nargs="+", default=[], metavar="AREA", help="areas the feature touches (prefix match)")
-    s.add_argument("--grep", nargs="+", default=[], metavar="WORD", help="words to look for in ADR and spec files")
+    s.add_argument("--area", nargs="+", action="extend", default=[], metavar="AREA", help="areas the feature touches (prefix match)")
+    s.add_argument("--grep", nargs="+", action="extend", default=[], metavar="WORD", help="words to look for in ADR and spec files")
     s.set_defaults(fn=cmd_context)
 
     s = sub.add_parser("checks", help="review checks from the `## Review checks` of ADRs and specs: all, or those in some areas or around a task")
-    s.add_argument("--area", nargs="+", default=[], metavar="AREA", help="areas the change touches (prefix match)")
+    s.add_argument("--area", nargs="+", action="extend", default=[], metavar="AREA", help="areas the change touches (prefix match)")
     s.add_argument("--task", metavar="SLUG", help="a task: the checks of its ADRs and specs, and of everything in their areas")
     s.set_defaults(fn=cmd_checks)
 
-    s = sub.add_parser("link", help="add ADR or spec links to a task in any state (fixing history, not re-planning)")
-    s.add_argument("slug")
-    s.add_argument("--arch", nargs="+", default=[], metavar="ADR")
-    s.add_argument("--spec", nargs="+", default=[], metavar="SPEC")
+    s = sub.add_parser("link", help="add links to a task (--arch, --spec), a question (--task, --blocks, --arch) or an ADR (--amends, --supersedes) in any state, instead of editing frontmatter by hand")
+    s.add_argument("slug", help="a task, question or architecture decision")
+    s.add_argument("--as", dest="as_", choices=["task", "question", "adr"], help="what the slug names, when a task and a question share it")
+    s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR")
+    s.add_argument("--spec", nargs="+", action="extend", default=[], metavar="SPEC")
+    s.add_argument("--task", nargs="+", action="extend", default=[], metavar="TASK")
+    s.add_argument("--blocks", nargs="+", action="extend", default=[], metavar="TASK")
+    s.add_argument("--amends", nargs="+", action="extend", default=[], metavar="ADR")
+    s.add_argument("--supersedes", nargs="+", action="extend", default=[], metavar="ADR")
     s.set_defaults(fn=cmd_link)
 
     s = sub.add_parser("dep", help="add or remove dependencies: TASK depends on PREREQs")
@@ -1697,7 +1796,7 @@ def main():
     s.add_argument("state", nargs="?", choices=[*OPEN_STATES, "done"])
     s.set_defaults(fn=cmd_list)
 
-    s = sub.add_parser("ready", help="list todo/tech-debt tasks whose prerequisites are all done: slug, state, title, tasks waiting behind it")
+    s = sub.add_parser("ready", help="list todo/tech-debt tasks whose prerequisites are all done: slug, state, title, tasks waiting behind it, needs")
     s.set_defaults(fn=cmd_ready)
 
     s = sub.add_parser("show", help="show a task's state, file, dependencies and architecture decisions")
@@ -1718,25 +1817,26 @@ def main():
     s = sub.add_parser("ask", help="record an open question, linked to the tasks and ADRs it concerns")
     s.add_argument("slug")
     s.add_argument("--title", required=True)
-    s.add_argument("--task", nargs="+", default=[], metavar="TASK", help="tasks the question came up in or concerns")
-    s.add_argument("--arch", nargs="+", default=[], metavar="ADR", help="architecture decisions it touches (file name without .md)")
-    s.add_argument("--blocks", nargs="+", default=[], metavar="TASK", help="tasks that can't start until it's answered")
+    s.add_argument("--task", nargs="+", action="extend", default=[], metavar="TASK", help="tasks the question came up in or concerns")
+    s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR", help="architecture decisions it touches (file name without .md)")
+    s.add_argument("--blocks", nargs="+", action="extend", default=[], metavar="TASK", help="tasks that can't start until it's answered")
     s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("questions", help="list open questions by priority (most blocked tasks, most linked tasks, oldest): slug, state, title, tasks, blocked tasks, asked")
     s.add_argument("--task", metavar="SLUG", help="only questions linked to or blocking this task")
     s.add_argument("--arch", metavar="ADR", help="only questions touching this architecture decision")
     s.add_argument("--all", action="store_true", help="include answered questions")
+    s.add_argument("--since", metavar="REV", help="only questions added since this commit (shared mode)")
     s.set_defaults(fn=cmd_questions)
 
     s = sub.add_parser("blockers", help="open questions that are the only thing holding up a task: slug, title, blocked tasks, work waiting behind them, asked")
-    s.add_argument("--json", action="store_true", help="print {open, blockers: [{slug, title, blocks, downstream, asked}]}")
+    s.add_argument("--json", action="store_true", help="print {open, blockers: [{slug, title, blocks, held, downstream, asked}]}; held are the blocked tasks already in progress")
     s.add_argument("--main", action="store_true", dest="main", help="same as the global --main, kept for callers that pass it here")
     s.set_defaults(fn=cmd_blockers)
 
     s = sub.add_parser("defer", help="hide an open question from the default list until the given tasks are done")
     s.add_argument("slug")
-    s.add_argument("--until", nargs="+", required=True, metavar="TASK")
+    s.add_argument("--until", nargs="+", action="extend", required=True, metavar="TASK")
     s.set_defaults(fn=cmd_defer)
 
     s = sub.add_parser("answer", help="mark a question answered once its `## Answer` section is written")
