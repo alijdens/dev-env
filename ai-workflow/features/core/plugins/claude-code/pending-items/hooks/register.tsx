@@ -1,12 +1,17 @@
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import type { Item, Pending } from '../types'
+import type { Item, Pending, Stored } from '../types'
 
 const PLUGIN = 'pending-items'
 const ADD = `mcp__${PLUGIN}__add`
 const RESOLVE = `mcp__${PLUGIN}__resolve`
 const EMPTY: Pending = { items: [], nextId: 1 }
+// Items outlive the process in $.store, one key per session, so `claude --resume` brings them back.
+const KEY_PREFIX = 'session:'
+// Claude Code's default transcript retention: past it the session can't be resumed anyway.
+const MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000
+const MAX_SESSIONS = 50
 
 const pending = atom({ plugin: 'pending-items', key: 'pending' } as const, EMPTY)
 
@@ -17,6 +22,65 @@ The person follows long sessions and can miss something you need from them. When
 
 function list(items: Item[]) {
   return items.length === 0 ? 'Nothing pending.' : items.map(i => `${i.id}. ${i.text}`).join('\n')
+}
+
+function isStored(value: unknown): value is Stored {
+  const v = value as Stored | undefined
+  return !!v && Array.isArray(v.items) && typeof v.nextId === 'number' && typeof v.updatedAt === 'number'
+}
+
+type $ = EngineInterface
+
+// The atom belongs to one session; a resume or a /resume into another session swaps in that one's stored items.
+async function sync($: $): Promise<Pending> {
+  const sessionId = await $.session.id()
+  const current = (await read($, pending)) ?? EMPTY
+  if (current.sessionId === sessionId) return current
+  let next: Pending
+  if (current.sessionId === undefined && current.items.length > 0) {
+    // MIGRATION(pending-items-persist): a value a hot reload kept from the version before items were persisted
+    // has no session yet: it is this one's. Remove once no session from before that version is running.
+    next = { ...current, sessionId }
+    await persist($, next)
+  } else {
+    const stored = await $.store.get(KEY_PREFIX + sessionId)
+    next = isStored(stored) ? { items: stored.items, nextId: stored.nextId, sessionId } : { ...EMPTY, sessionId }
+  }
+  await update($, pending, () => next)
+  return next
+}
+
+async function persist($: $, p: Pending) {
+  if (!p.sessionId) return
+  const key = KEY_PREFIX + p.sessionId
+  if (p.items.length === 0) await $.store.delete(key)
+  else await $.store.set(key, { items: p.items, nextId: p.nextId, updatedAt: await $.clock.now() } satisfies Stored)
+}
+
+async function mutate($: $, fn: (p: Pending) => Pending): Promise<Pending> {
+  await sync($)
+  let result = EMPTY
+  await update($, pending, p => (result = fn(p ?? EMPTY)))
+  await persist($, result)
+  return result
+}
+
+// Drops sessions untouched for longer than a transcript is kept, then all but the most recent ones.
+async function collectGarbage($: $) {
+  const now = await $.clock.now()
+  const sessions: { key: string; updatedAt: number }[] = []
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(KEY_PREFIX)) continue
+    const stored = await $.store.get(key)
+    if (!isStored(stored) || now - stored.updatedAt > MAX_AGE_MS) await $.store.delete(key)
+    else sessions.push({ key, updatedAt: stored.updatedAt })
+  }
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+  for (const { key } of sessions.slice(MAX_SESSIONS)) await $.store.delete(key)
+}
+
+function workPrompt(items: Item[]) {
+  return `Let's work through what you're waiting on from me, one item at a time, in this order:\n${list(items)}\n\nFor each: say in a few lines what you need from me and the context I need to decide, then wait for my answer. Act on it, resolve the item, and only then move to the next one.`
 }
 
 export const register: Register = on => {
@@ -35,9 +99,24 @@ export const register: Register = on => {
       isDeferred: false,
     })
     if (e.isInteractive) {
-      await $.command.register({ name: 'pending', description: 'What the model is waiting on from you; `/pending clear` drops it all, `/pending done <id>` one item.', argumentHint: '[clear | done <id>]' })
+      await $.command.register({ name: 'pending', description: 'What the model is waiting on from you; `/pending work` drafts a prompt to go through the items with it one by one, `/pending done <id>` drops one, `/pending clear` all.', argumentHint: '[work | done <id> | clear]' })
     }
+    await sync($)
+    await collectGarbage($)
     return started
+  })
+
+  // After /clear the agent no longer has the context the items were raised in, so they go; on an exit or a
+  // /resume into another session they stay stored for a later resume of this one.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') await $.store.delete(KEY_PREFIX + e.sessionId)
+    if (e.reason === 'clear' || e.reason === 'resume') await update($, pending, () => EMPTY)
+    return next(e)
+  })
+
+  on('prompt.submit', async ($, e, next) => {
+    await sync($)
+    return next(e)
   })
 
   on('prompt.compose', async ($, e, next) => {
@@ -48,34 +127,41 @@ export const register: Register = on => {
   on('tool.call', { tool: ADD }, async ($, e) => {
     const text = typeof e.text === 'string' ? e.text.trim() : ''
     if (!text) return { deny: 'add needs a non-empty `text`' }
+    const addedAt = new Date(await $.clock.now()).toISOString()
     let id = 0
-    await update($, pending, p => {
-      const current = p ?? EMPTY
+    await mutate($, current => {
       id = current.nextId
-      return { items: [...current.items, { id, text, addedAt: new Date().toISOString() }], nextId: id + 1 }
+      return { ...current, items: [...current.items, { id, text, addedAt }], nextId: id + 1 }
     })
     return { result: `pending item ${id} added: ${text}` }
   })
 
   on('tool.call', { tool: RESOLVE }, async ($, e) => {
     const id = typeof e.id === 'number' ? e.id : Number(e.id)
-    const current = (await read($, pending)) ?? EMPTY
+    const current = await sync($)
     if (!current.items.some(i => i.id === id)) return { deny: `no pending item ${id}; open: ${list(current.items)}` }
-    await update($, pending, p => ({ ...(p ?? EMPTY), items: (p ?? EMPTY).items.filter(i => i.id !== id) }))
+    await mutate($, p => ({ ...p, items: p.items.filter(i => i.id !== id) }))
     return { result: `pending item ${id} resolved` }
   })
 
   on('command.run', { command: 'pending' }, async ($, e) => {
     const [verb, arg] = (e.args ?? '').trim().split(/\s+/)
-    const current = (await read($, pending)) ?? EMPTY
+    const current = await sync($)
+    if (verb === 'work') {
+      if (current.items.length === 0) return { text: 'Nothing pending.' }
+      // Into the input box rather than submitted: a command can't start a turn while it holds one, and this
+      // way the person can edit the prompt before sending it.
+      await $.prompt.fill({ text: workPrompt(current.items) })
+      return { text: `The prompt to go through ${current.items.length} pending item${current.items.length === 1 ? '' : 's'} is in the input box; press Enter to start.` }
+    }
     if (verb === 'clear') {
-      await update($, pending, p => ({ ...(p ?? EMPTY), items: [] }))
+      await mutate($, p => ({ ...p, items: [] }))
       return { text: `Cleared ${current.items.length} pending item${current.items.length === 1 ? '' : 's'}.` }
     }
     if (verb === 'done') {
       const id = Number(arg)
       if (!current.items.some(i => i.id === id)) return { text: `No pending item ${arg ?? ''}.\n${list(current.items)}` }
-      await update($, pending, p => ({ ...(p ?? EMPTY), items: (p ?? EMPTY).items.filter(i => i.id !== id) }))
+      await mutate($, p => ({ ...p, items: p.items.filter(i => i.id !== id) }))
       return { text: `Resolved ${id}.` }
     }
     return { text: list(current.items) }
