@@ -15,7 +15,7 @@ For each question, in this order, stopping after each step for the user:
 3. **Record** the answer once the user gives one: write it under `## Answer` in the user's terms, tightened, including the reasoning if they gave one, and show it in a line for confirmation.
 4. **Convert** the answer into work or decisions, proposing in one line and acting on a yes:
    - It changes or makes an architecture decision: a new ADR (`sdd adr`), superseding the old one if any, linked from the Answer. Re-planning the affected tasks is the `sdd-planning` skill; say so rather than doing it here, and hold each affected task with a blocking question meanwhile (`sdd ask replan-<slug> --title "Re-plan <slug> after <adr>" --blocks <slug> --arch <adr>`, Context saying what changed), so nobody claims it before the re-plan; a Notes line doesn't keep it out of `sdd ready`.
-   - It needs work that no task covers: `sdd new` (tech-debt when it's a follow-up), with `--after` and `--arch` as needed, and a Goal that quotes the answer.
+   - It needs work that no task covers: `sdd new` (tech-debt when it's a follow-up), with `--after` and `--arch` as needed, and a Goal that quotes the answer. Work that needs designing first is an idea instead (`sdd idea`, see `overview.md`), its Context quoting the answer.
    - It changes what an existing task must do: edit that task's Notes or acceptance criteria, in a line that cites the question.
    - It only unblocks: nothing to convert.
    - It's obsolete (the code moved on, the task was dropped): the Answer says so and why.
