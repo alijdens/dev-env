@@ -20,6 +20,10 @@ A `parse_date` lib function used by a `ReportService`, exposed through a `/repor
 - `ReportService` tests: a valid date filters reports as expected; an invalid date surfaces the service's error. Don't re-test every date format.
 - `/reports` endpoint tests: a valid request returns the report; the service error maps to the right HTTP status. Don't re-test service logic.
 
+## Prove a test can fail
+
+A test only counts as covering a guard, a bound or a branch if it fails when that code is taken out. Before claiming coverage for one (in a PR description, a review or a report), check it: remove or invert the guarded line in a scratch copy and run the test; if it still passes, the test asserts something else. A probe that hangs instead of failing (a removed loop bound, a removed timeout) is not a kill either: the test needs its own bound so a broken guard fails fast. Don't claim coverage you didn't check this way.
+
 ## Don't wait on real time
 
 Tests must not depend on real sleeps or wall-clock time: they are slow, and they fail under load for reasons unrelated to the code. Raising a timeout or adding a delay is never the fix for a flaky test.

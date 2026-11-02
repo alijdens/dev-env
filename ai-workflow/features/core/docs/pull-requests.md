@@ -6,7 +6,7 @@ Load this file only when asked to commit or open a PR. These are general prefere
 
 - Branch off the current branch unless told so; never commit directly to the main branch.
 - Write commit messages as a short imperative subject line, plus a body only when the diff alone doesn't explain the *why*.
-- Run the repository's checks (format/lint/type/tests, pre-commit hooks) before committing or opening the PR.
+- Run the repository's checks (format/lint/type/tests, pre-commit hooks) before committing or opening the PR, and again after every rebase, a docs-only one included. Name the commit the checks ran on when reporting them (the PR description or the report), so a reviewer can tell whether the checked tree is the one under review.
 - Before committing, make sure there are no unrelated files in the index to avoid accidentally including unrelated changes.
 
 ## PR size
@@ -41,7 +41,7 @@ Content rules that apply at every size:
 
 When the change is something a user sees (a page, a component, a CLI's output, a rendered document) and a picture says more than a paragraph, show it: run the change and capture a screenshot, or a short recording for an interaction or an animation, and put it in the description, before/after for a change to something that already existed. Use whatever browser tooling the session has (a browser automation tool or extension that can open the running app and take screenshots or GIF recordings); start the app the way the repo's docs say and capture the real feature, not a mock. Crop to the relevant part and make sure no personal or private data is in the frame.
 
-Skip it when the change isn't visible or an image adds nothing (a copy tweak the title already states, a change with no observable difference). If no browser tooling is available or the app can't be run in the session, leave a clearly marked placeholder for the author instead of describing what the screenshot would show.
+Skip it when the change isn't visible or an image adds nothing (a copy tweak the title already states, a change with no observable difference). If no browser tooling is available or the app can't be run in the session, leave a clearly marked placeholder for the author instead of describing what the screenshot would show. When the capture exists but can't be uploaded from the session, the placeholder names the local file, so whoever finishes the PR only has to attach it.
 
 ### Formatting rules
 
@@ -81,10 +81,10 @@ Skip Tests/Docs sections and test-plan checklists unless a reviewer needs specif
 
 Edit a local copy of the description instead of rewriting it inline, and make sure GitHub's version didn't change in the meantime:
 
-1. Run `pull-pr-description <PR id>` (on `PATH`; pass `-R owner/repo` after the id when outside the PR's repo). It syncs the description into `/tmp/prs/<PR id>.description.md` and prints `path:` and `status:`.
+1. Run `pull-pr-description <PR id>` (on `PATH`; pass `-R owner/repo` after the id when outside the PR's repo). It syncs the description into a local file, keyed by repo and PR, and prints `path:` and `status:`. Use the printed path in the steps below.
 2. Read the file only when `status` is `new` or `updated`. On `unchanged` your earlier read is still current; on `conflict` GitHub changed while the local file has unpushed edits: read GitHub's version (`gh pr view <PR id> --json body --jq .body`) and merge its changes into the local file, keeping both sides' intent. Ask the user only if the two sides contradict each other.
 3. Edit the file.
-4. Re-run the script right before pushing; on `conflict`, handle it as in step 2 (it keeps reporting `conflict` until the merged file is pushed, so don't re-check after merging). Push with `gh pr edit <PR id> --body-file /tmp/prs/<PR id>.description.md`.
+4. Re-run the script right before pushing; on `conflict`, handle it as in step 2 (it keeps reporting `conflict` until the merged file is pushed, so don't re-check after merging). Push with `gh pr edit <PR id> --body-file <path>`.
 5. Re-run the script once more so its baseline matches what was pushed (expect `unchanged`).
 
 When not specified, default to opening PRs in "draft" rather than ready to review.

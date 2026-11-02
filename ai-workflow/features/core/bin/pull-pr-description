@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Syncs a PR description from GitHub into /tmp/prs/<PR id>.description.md and reports whether
-# it changed, so callers only re-read the file when needed. Runs in the current repo (or pass
-# `-R owner/repo` after the PR id).
+# Syncs a PR description from GitHub into a local file and reports whether it changed, so callers
+# only re-read the file when needed. Runs in the current repo (or pass `-R owner/repo` after the
+# PR id). The file lives under ${TMPDIR:-/tmp}/prs/<owner>/<repo>/, so PRs with the same number in
+# different repos don't share a copy.
 #
 # Usage: pull-pr-description <PR id> [gh pr view flags...]
 #
@@ -21,25 +22,41 @@ fi
 pr="$1"
 shift
 
-dir=/tmp/prs
+fetched="$(mktemp)"
+raw="$(mktemp)"
+trap 'rm -f "$fetched" "$raw"' EXIT
+# One call for both: the first line is the url, the rest the body.
+gh pr view "$pr" "$@" --json body,url --template '{{.url}}{{"\n"}}{{.body}}' > "$raw"
+# https://<host>/<owner>/<repo>/pull/<n>, on github.com and GHES alike.
+repo_path="$(head -n1 "$raw" | sed -n 's#^https\?://[^/]*/\([^/]*\)/\([^/]*\)/pull/.*#\1/\2#p')"
+if [[ -z "$repo_path" ]]; then
+  echo "could not tell the repo from the PR url: $(head -n1 "$raw")" >&2
+  exit 1
+fi
+tail -n +2 "$raw" > "$fetched"
+
+dir="${TMPDIR:-/tmp}/prs/$repo_path"
 file="$dir/$pr.description.md"
 base="$dir/$pr.description.remote.md" # last version seen on GitHub, to tell local edits from remote changes
-fetched="$(mktemp)"
-trap 'rm -f "$fetched"' EXIT
-
 mkdir -p "$dir"
-gh pr view "$pr" "$@" --json body --jq .body > "$fetched"
+
+# GitHub may store CRLF and editors add a final newline, so bytes differ after every push although
+# nothing changed: compare with line endings, trailing whitespace and trailing blank lines normalised.
+same() {
+  cmp -s <(sed 's/\r$//; s/[[:space:]]*$//' "$1" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}') \
+         <(sed 's/\r$//; s/[[:space:]]*$//' "$2" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+}
 
 if [[ ! -f "$file" || ! -f "$base" ]]; then
   status=new
   cp "$fetched" "$file"
   cp "$fetched" "$base"
-elif cmp -s "$fetched" "$file"; then
+elif same "$fetched" "$file"; then
   status=unchanged
   cp "$fetched" "$base"
-elif cmp -s "$fetched" "$base"; then
+elif same "$fetched" "$base"; then
   status=unchanged
-elif cmp -s "$file" "$base"; then
+elif same "$file" "$base"; then
   status=updated
   cp "$fetched" "$file"
   cp "$fetched" "$base"

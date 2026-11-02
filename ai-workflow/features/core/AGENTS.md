@@ -18,12 +18,21 @@ The goal: the user wants control over what happens on the machine. Agents can be
 
 - Don't create worktrees or switch branches unless asked.
 - When asked to work in a worktree, default to branching from latest origin/main unless told differently.
-- Exception for read-only reviews: if asked to review a PR that isn't checked out, it's OK to create an isolated environment (e.g. a temporary worktree) to fetch and review it there. Reviewing never means modifying the working copy.
+- Exception for read-only reviews: if asked to review a PR that isn't checked out, it's OK to create an isolated environment (e.g. a temporary worktree) to fetch and review it there. Reviewing never means modifying the working copy, and read-only extends to the repository: fetch the PR's head into a detached worktree (`git fetch origin pull/<n>/head && git worktree add --detach <tmp> FETCH_HEAD`), create no branches or refs in the user's repo, and remove the worktree afterwards.
 - Requests for *changes* always mean changes in the working copy where the agent was invoked. If that requires checking out a different branch or creating a worktree, STOP and say so instead of doing it.
 
 ## Stop when something does not look right
 
 If a task can't be fulfilled because something looks like an error, stop — don't push through walls that are not meant to be broken. Example: the user asks to address a comment in a PR, but the PR belongs to another repository, a different worktree, or an unrelated branch. Don't agree and continue blindly (e.g. "the user asked for changes in repo X but we are in Y, so let me go to X and..."). Tasks are sometimes under-specified or the user may have mixed up threads; double-check the user has not mistaken the conversation.
+
+## Commands, scratch space and secrets
+
+- Run commands with stdin closed (`</dev/null`) and never start something that waits for input: a sub-agent that blocks on a prompt stalls silently.
+- Chain dependent steps with `&&` and read the exit code yourself; don't take a notification or a log tail for a result. Keep a log until the step that needed it has succeeded.
+- Scratch work (a probe, a copy of a repo, a build) goes in a fresh `mktemp -d` with caches of its own, removed when done. Never remove or rebuild caches, containers or volumes that other sessions on the machine may share.
+- Secrets: read one from an environment variable, never print or paste it, and check the diff for it before committing.
+- When stating what a file, doc or API says, point at where (file and line, section); mark anything recalled from memory as such.
+- Do what was asked or say it can't be done. Don't quietly park an unmet requirement in a note, a TODO or a question and report the work as finished.
 
 ## Commits and pull requests
 
