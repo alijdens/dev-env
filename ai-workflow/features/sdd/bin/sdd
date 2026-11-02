@@ -16,13 +16,15 @@ Layout under the data root:
   tasks/{todo,in-progress,tech-debt}/<slug>.md
   tasks/done/YYYY-MM-DD/<slug>.md        grouped by the date `sdd done` ran
   questions/{open,answered}/<slug>.md    open questions, linked to tasks and ADRs
+  ideas/{open,closed}/<slug>.md          ideas waiting for a planning session, by area
 
 A task's state is the directory its file is in, and its prerequisites are the `after:` list in
 its frontmatter, so each task is one self-contained file: branches that add or finish different
 tasks never touch the same file and merge cleanly. The dependency graph is derived from those
 files (`sdd render`); done tasks keep their `after:` as history. Questions work the same way:
 one file each, linked through `tasks:`/`arch:` frontmatter, and an open question that `blocks:`
-a task keeps it out of `sdd ready` like an unmet prerequisite.
+a task keeps it out of `sdd ready` like an unmet prerequisite. Ideas are never startable: they are
+input for a later planning session, ready to plan once the tasks in their `after:` are done.
 """
 import argparse
 import datetime
@@ -44,12 +46,13 @@ FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
 OPEN_STATES = ("todo", "in-progress", "tech-debt")
 STARTABLE = ("todo", "tech-debt")
 QUESTION_STATES = ("open", "answered")
+IDEA_STATES = ("open", "closed")
 ADR_STATUSES = ("proposed", "accepted", "superseded", "deprecated")
 ADR_MAX_LINES = 100
 CHECKS_SECTION = "Review checks"
 CHECKS_MAX = 10
 AGENT_FILES = ("AGENTS.md", "CLAUDE.md")
-LIST_KEYS = ("after", "arch", "spec", "needs", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by")
+LIST_KEYS = ("after", "arch", "spec", "needs", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by", "into")
 LEGACY_STATUS_RE = re.compile(r"^- Status:\s*(.+?)\s*$", re.M)
 LEGACY_DATE_RE = re.compile(r"^- Date:\s*(\S+)\s*$", re.M)
 LOCAL_KEY = "sdd.root"
@@ -113,6 +116,23 @@ asked: {date}
 ## Context
 
 ## Answer
+"""
+
+IDEA_TEMPLATE = """\
+---
+title: {title}
+areas: [{areas}]
+after: [{after}]
+tasks: [{tasks}]
+arch: [{arch}]
+raised: {date}
+---
+
+## Idea
+
+## Context
+
+## Outcome
 """
 
 # Project-level docs that planning and reviews read first. Each section's comment is the brief
@@ -181,6 +201,7 @@ GUIDANCE_RE = re.compile(r"<!--.*?-->", re.S)
 
 Task = namedtuple("Task", "state path date meta")
 Question = namedtuple("Question", "state path meta")
+Idea = namedtuple("Idea", "state path meta")
 
 
 class Error(Exception):
@@ -377,10 +398,12 @@ class Project:
         self.tasks_dir = os.path.join(root, "tasks")
         self.arch_dir = os.path.join(root, "arch")
         self.questions_dir = os.path.join(root, "questions")
+        self.ideas_dir = os.path.join(root, "ideas")
 
     def state_dirs(self):
         yield from (os.path.join(self.tasks_dir, s) for s in OPEN_STATES)
         yield from (os.path.join(self.questions_dir, s) for s in QUESTION_STATES)
+        yield from (os.path.join(self.ideas_dir, s) for s in IDEA_STATES)
 
     def ensure_dirs(self):
         # Without a placeholder, moving the last file out of a state dir looks like a directory
@@ -407,6 +430,19 @@ class Project:
         if not q:
             raise Error(f"unknown question: {slug}")
         return q
+
+    def idea_files(self):
+        """Yields (slug, state, path)."""
+        for state in IDEA_STATES:
+            d = os.path.join(self.ideas_dir, state)
+            if os.path.isdir(d):
+                for name in sorted(os.listdir(d)):
+                    if name.endswith(".md"):
+                        yield name[:-3], state, os.path.join(d, name)
+
+    def ideas(self):
+        """Maps slug -> Idea. Duplicates are reported by `validate`; last one wins here."""
+        return {slug: Idea(state, path, frontmatter(path)) for slug, state, path in self.idea_files()}
 
     def task_files(self):
         """Yields (slug, state, path, done_date)."""
@@ -747,7 +783,9 @@ def format_section(path):
         f"(`sdd-planning`, `sdd-claim-task`, `sdd-review-task`, `sdd-orchestrate`) are {origin}.\n\n"
         f"sdd: {path}\n\n"
         f"When planning a feature, use the `sdd-planning` skill. When working on or claiming a task, use the `sdd-claim-task` skill. When reviewing a task's PR, use the `sdd-review-task` skill. When orchestrating tasks with sub-agents, use the `sdd-orchestrate` skill. "
-        f"To write or revise the project's goal or principles docs, use the `sdd-setup-task-workflow` skill.\n\n"
+        f"To write or revise the project's goal or principles docs, use the `sdd-setup-task-workflow` skill. "
+        f"An idea to plan later rather than now is recorded with `sdd idea <slug> --title \"...\" --areas <area>... [--after <task>...]`, "
+        f"filling in its Idea and Context sections so it stands alone; planning sessions pick it up from there.\n\n"
         f"`{path}/goal.md` and `{path}/principles.md`, when present, say what the project is for and the rules every change must respect: read them before planning or reviewing, and treat them as the context every task belongs to. "
         f"`sdd checks --task <slug>` prints the project-specific review checks for a task's areas.\n"
         f"{SECTION_FOOTER}\n"
@@ -941,7 +979,7 @@ def cmd_areas(args):
 def cmd_context(args):
     """A reading list for planning in some areas: foundations, matching ADRs and specs, and the work and questions around them."""
     proj = find_project(args.dir)
-    adrs, tasks, specs, questions = proj.adr_metas(), proj.tasks(), proj.specs(), proj.questions()
+    adrs, tasks, specs, questions, ideas = proj.adr_metas(), proj.tasks(), proj.specs(), proj.questions(), proj.ideas()
     refs = adr_refs(adrs, tasks, specs)
     words = [w.lower() for w in args.grep]
 
@@ -984,6 +1022,10 @@ def cmd_context(args):
     for slug, q in sorted(questions.items(), key=lambda kv: (kv[1].state != "open", kv[0])):
         if relevant & set(q.meta.get("arch") or []):
             print(f"  {slug}\t{q.state}\t{q.meta.get('title', '')}")
+    print("ideas in these areas or on them (closed ones were planned or dropped already):")
+    for slug, i in sorted(ideas.items(), key=lambda kv: (kv[1].state != "open", kv[0])):
+        if relevant & set(i.meta.get("arch") or []) or matches(i.path, i.meta):
+            print(f"  {slug}\t{idea_state(i, tasks)}\t{i.meta.get('title', '')}")
 
 
 def cmd_checks(args):
@@ -1020,26 +1062,29 @@ def add_links(path, meta, key, new):
 
 
 def cmd_link(args):
-    """Adds links to a task (ADRs, specs), a question (tasks, blocked tasks, ADRs) or an ADR (amends,
-    supersedes) in any state: a missing link is a fact about history, not a re-plan, and the
+    """Adds links to a task (ADRs, specs), a question (tasks, blocked tasks, ADRs), an idea (tasks, ADRs,
+    areas) or an ADR (amends, supersedes) in any state: a missing link is a fact about history, not a re-plan, and the
     alternative is editing frontmatter by hand."""
     proj = find_project(args.dir)
-    tasks, questions, adrs, specs = proj.tasks(), proj.questions(), proj.adr_metas(), proj.specs()
-    kinds = [k for k, found in (("task", args.slug in tasks), ("question", args.slug in questions), ("adr", args.slug in adrs)) if found]
+    tasks, questions, adrs, specs, ideas = proj.tasks(), proj.questions(), proj.adr_metas(), proj.specs(), proj.ideas()
+    kinds = [k for k, found in (("task", args.slug in tasks), ("question", args.slug in questions), ("idea", args.slug in ideas),
+                                ("adr", args.slug in adrs)) if found]
     if args.as_ and args.as_ not in kinds:
         raise Error(f"unknown {args.as_}: {args.slug}")
     if not kinds:
-        raise Error(f"unknown task, question or architecture decision: {args.slug}")
+        raise Error(f"unknown task, question, idea or architecture decision: {args.slug}")
     if len(kinds) > 1 and not args.as_:
         raise Error(f"{args.slug} is both a {' and a '.join(kinds)}; pass --as {'|'.join(kinds)}")
     kind = args.as_ or kinds[0]
-    allowed = {"task": ("arch", "spec"), "question": ("task", "blocks", "arch"), "adr": ("amends", "supersedes")}[kind]
-    given = [k for k in ("arch", "spec", "task", "blocks", "amends", "supersedes") if getattr(args, k)]
+    allowed = {"task": ("arch", "spec"), "question": ("task", "blocks", "arch"), "idea": ("task", "arch", "areas"),
+               "adr": ("amends", "supersedes")}[kind]
+    given = [k for k in ("arch", "spec", "task", "blocks", "areas", "amends", "supersedes") if getattr(args, k)]
     if not given:
         raise Error("nothing to link")
     for k in given:
         if k not in allowed:
-            raise Error(f"--{k} doesn't apply to a {kind}; a {kind} takes {', '.join('--' + x for x in allowed)}")
+            article = "an" if kind[0] in "aeiou" else "a"
+            raise Error(f"--{k} doesn't apply to {article} {kind}; {article} {kind} takes {', '.join('--' + x for x in allowed)}")
     for a in [*args.arch, *args.amends, *args.supersedes]:
         if a not in adrs:
             raise Error(f"unknown architecture decision: {a}")
@@ -1057,6 +1102,11 @@ def cmd_link(args):
         add_links(q.path, q.meta, "tasks", args.task)
         add_links(q.path, q.meta, "blocks", args.blocks)
         add_links(q.path, q.meta, "arch", args.arch)
+    elif kind == "idea":
+        i = ideas[args.slug]
+        add_links(i.path, i.meta, "tasks", args.task)
+        add_links(i.path, i.meta, "arch", args.arch)
+        add_links(i.path, i.meta, "areas", args.areas)
     else:
         a = adrs[args.slug]
         if a.legacy:
@@ -1114,6 +1164,10 @@ def cmd_spec(args):
 def cmd_dep(args):
     proj = find_project(args.dir)
     tasks = proj.tasks()
+    if args.task not in tasks:
+        ideas = proj.ideas()
+        if args.task in ideas:
+            return idea_dep(proj, args, ideas[args.task], tasks)
     for s in [args.task, *args.prereqs]:
         proj.get(s, tasks)
     t = tasks[args.task]
@@ -1121,19 +1175,30 @@ def cmd_dep(args):
         # Changing the plan of claimed or finished work behind its owner's back is how two plans
         # for the same task come about; follow-up tasks that depend on it are the way instead.
         raise Error(f"{args.task} is {t.state}: its prerequisites are fixed; plan follow-up tasks with `--after {args.task}` instead")
-    current = list(t.meta.get("after") or [])
-    if args.action == "add":
-        if args.task in args.prereqs:
-            raise Error("a task can't depend on itself")
-        after = current + [p for p in args.prereqs if p not in current]
-    else:
-        missing = [p for p in args.prereqs if p not in current]
-        if missing:
-            raise Error("no such dependencies: " + ", ".join(f"{p} -> {args.task}" for p in sorted(missing)))
-        after = [p for p in current if p not in args.prereqs]
+    after = edit_after(list(t.meta.get("after") or []), args.action, args.prereqs, args.task)
     tasks[args.task] = t._replace(meta={**t.meta, "after": after})
     check_dag(tasks)
     set_meta(t.path, "after", after)
+
+
+def edit_after(current, action, prereqs, slug):
+    if action == "add":
+        if slug in prereqs:
+            raise Error("a task can't depend on itself")
+        return current + [p for p in prereqs if p not in current]
+    missing = [p for p in prereqs if p not in current]
+    if missing:
+        raise Error("no such dependencies: " + ", ".join(f"{p} -> {slug}" for p in sorted(missing)))
+    return [p for p in current if p not in prereqs]
+
+
+def idea_dep(proj, args, idea, tasks):
+    # Ideas only wait on tasks: an idea that needs another one planned first is part of that one.
+    if idea.state != "open":
+        raise Error(f"idea {args.task} is {idea.state}")
+    for p in args.prereqs:
+        proj.get(p, tasks)
+    set_meta(idea.path, "after", edit_after(list(idea.meta.get("after") or []), args.action, args.prereqs, args.task))
 
 
 def cmd_rm(args):
@@ -1145,6 +1210,9 @@ def cmd_rm(args):
     deps = Graph.from_tasks(tasks).dependents(args.slug)
     if deps:
         raise Error(f"{args.slug} is a prerequisite of: {', '.join(deps)} (remove those dependencies first)")
+    waiting = sorted(s for s, i in proj.ideas().items() if args.slug in (i.meta.get("after") or []))
+    if waiting:
+        raise Error(f"ideas wait on {args.slug}: {', '.join(waiting)} (`sdd dep rm <idea> {args.slug}` first)")
     os.remove(t.path)
     proj.ensure_dirs()
 
@@ -1348,6 +1416,74 @@ def cmd_answer(args):
     print(proj.move(q.path, os.path.join(proj.questions_dir, "answered")))
 
 
+def idea_waiting(idea, tasks):
+    """The tasks an open idea waits on: planning it before they are done designs against code that doesn't exist yet."""
+    return [s for s in idea.meta.get("after") or [] if tasks.get(s, Task(None, None, None, {})).state != "done"]
+
+
+def idea_state(idea, tasks):
+    if idea.state != "open":
+        return idea.state
+    waiting = idea_waiting(idea, tasks)
+    return f"waiting on {','.join(waiting)}" if waiting else "ready"
+
+
+def cmd_idea(args):
+    check_slug(args.slug)
+    proj = find_project(args.dir)
+    tasks, adrs = proj.tasks(), proj.adrs()
+    if args.slug in proj.ideas():
+        raise Error(f"idea {args.slug} already exists")
+    for s in [*args.after, *args.task]:
+        proj.get(s, tasks)
+    for a in args.arch:
+        if a not in adrs:
+            raise Error(f"unknown architecture decision: {a}")
+    proj.ensure_dirs()
+    path = os.path.join(proj.ideas_dir, "open", f"{args.slug}.md")
+    with open(path, "w") as f:
+        f.write(IDEA_TEMPLATE.format(title=args.title, areas=", ".join(args.areas), after=", ".join(args.after),
+                                     tasks=", ".join(args.task), arch=", ".join(args.arch), date=today()))
+    print(path)
+
+
+def cmd_ideas(args):
+    proj = find_project(args.dir)
+    tasks = proj.tasks()
+    rows = []
+    for slug, i in proj.ideas().items():
+        if i.state != "open" and not args.all:
+            continue
+        if args.ready and (i.state != "open" or idea_waiting(i, tasks)):
+            continue
+        if args.area and not area_matches(args.area, i.meta.get("areas") or []):
+            continue
+        rows.append((i.state != "open", bool(idea_waiting(i, tasks)), i.meta.get("raised", ""), slug, i))
+    for *_, slug, i in sorted(rows, key=lambda r: r[:4]):
+        print("\t".join([slug, idea_state(i, tasks), i.meta.get("title", ""), ",".join(i.meta.get("areas") or []), i.meta.get("raised", "")]))
+
+
+def cmd_close_idea(args):
+    """Closes an idea once planning turned it into tasks and ADRs (`--into`) or dropped it; either way the
+    Outcome says what happened, so the idea isn't raised again as new."""
+    proj = find_project(args.dir)
+    i = proj.ideas().get(args.slug)
+    if not i:
+        raise Error(f"unknown idea: {args.slug}")
+    if i.state != "open":
+        raise Error(f"idea {args.slug} is already closed")
+    known = set(proj.tasks()) | set(proj.adrs()) | set(proj.specs())
+    for x in args.into:
+        if x not in known:
+            raise Error(f"unknown task, architecture decision or spec: {x}")
+    if not sections(i.path).get("Outcome"):
+        raise Error(f"{i.path}: write what became of it under `## Outcome` first")
+    set_meta(i.path, "closed", today())
+    if args.into:
+        set_meta(i.path, "into", args.into)
+    print(proj.move(i.path, os.path.join(proj.ideas_dir, "closed")))
+
+
 def check_review_checks(path):
     """A reviewer reads checks from many files at once: each must be one bullet it can tick, and few enough to read."""
     bullets, prose = review_checks(path)
@@ -1380,6 +1516,9 @@ def cmd_validate(args):
             errors.append(f"{path}: missing title")
         tasks[slug] = Task(state, path, date, meta)
     for d in proj.state_dirs():
+        # Projects set up before ideas existed get their directories from the next mutating command.
+        if os.path.dirname(d) == proj.ideas_dir and not os.path.isdir(proj.ideas_dir):
+            continue
         if not os.path.isfile(os.path.join(d, ".gitkeep")):
             errors.append(f"missing {os.path.relpath(d, proj.root)}/.gitkeep (any mutating `sdd` command recreates it)")
     g = Graph.from_tasks(tasks)
@@ -1492,6 +1631,40 @@ def cmd_validate(args):
             blocking = open_blockers(questions, slug)
             if blocking:
                 warnings.append(f"{slug} is done but blocked by open questions: {', '.join(blocking)}")
+    seen, ideas = {}, {}
+    for slug, state, path in proj.idea_files():
+        if slug in seen:
+            errors.append(f"duplicate idea slug {slug}: {seen[slug]} and {path}")
+        seen[slug] = path
+        if not SLUG_RE.match(slug):
+            errors.append(f"invalid slug: {path}")
+        try:
+            meta = frontmatter(path)
+        except Error as e:
+            errors.append(str(e))
+            continue
+        ideas[slug] = Idea(state, path, meta)
+        body = sections(path)
+        # Planned weeks later by someone who wasn't there: a bare title can't be designed from.
+        for name in ("Idea", "Context"):
+            if not body.get(name):
+                errors.append(f"{path}: empty `## {name}` section")
+        if state == "closed" and not body.get("Outcome"):
+            errors.append(f"{path}: closed without an `## Outcome`")
+        if not meta.get("title"):
+            errors.append(f"{path}: missing title")
+        for key in ("after", "tasks"):
+            for s in meta.get(key) or []:
+                if s not in tasks:
+                    errors.append(f"{path}: unknown task {s} in {key}")
+        for a in meta.get("arch") or []:
+            if a not in adrs:
+                errors.append(f"{path}: unknown architecture decision {a}")
+        for x in meta.get("into") or []:
+            if x not in tasks and x not in adrs and x not in specs:
+                errors.append(f"{path}: unknown task, architecture decision or spec {x} in into")
+        if state == "open" and not meta.get("areas"):
+            warnings.append(f"{path}: no areas, so `sdd context` won't show it when planning in its areas")
     if proj.mode == "shared" and not args.dir:
         # The section in the agent file is a copy of this CLI's template, so repos fall behind upgrades.
         repo = toplevel()
@@ -1514,7 +1687,8 @@ def cmd_validate(args):
         print(f"error: {e}")
     if not errors:
         open_q = sum(1 for q in questions.values() if q.state == "open")
-        print(f"ok: {len(tasks)} tasks, {len(g.edges)} dependencies, {len(adrs)} architecture decisions, {open_q} open questions")
+        open_i = sum(1 for i in ideas.values() if i.state == "open")
+        print(f"ok: {len(tasks)} tasks, {len(g.edges)} dependencies, {len(adrs)} architecture decisions, {open_q} open questions, {open_i} open ideas")
     return 1 if errors else 0
 
 
@@ -1685,7 +1859,7 @@ def cmd_done(args):
 
 
 READ_ONLY = (cmd_ready, cmd_show, cmd_brief, cmd_list, cmd_context, cmd_checks, cmd_adrs, cmd_areas,
-             cmd_questions, cmd_blockers, cmd_validate, cmd_render, cmd_doc)
+             cmd_questions, cmd_blockers, cmd_ideas, cmd_validate, cmd_render, cmd_doc)
 
 
 def run_command(args):
@@ -1771,20 +1945,21 @@ def main():
     s.add_argument("--task", metavar="SLUG", help="a task: the checks of its ADRs and specs, and of everything in their areas")
     s.set_defaults(fn=cmd_checks)
 
-    s = sub.add_parser("link", help="add links to a task (--arch, --spec), a question (--task, --blocks, --arch) or an ADR (--amends, --supersedes) in any state, instead of editing frontmatter by hand")
-    s.add_argument("slug", help="a task, question or architecture decision")
-    s.add_argument("--as", dest="as_", choices=["task", "question", "adr"], help="what the slug names, when a task and a question share it")
+    s = sub.add_parser("link", help="add links to a task (--arch, --spec), a question (--task, --blocks, --arch), an idea (--task, --arch, --areas) or an ADR (--amends, --supersedes) in any state, instead of editing frontmatter by hand")
+    s.add_argument("slug", help="a task, question, idea or architecture decision")
+    s.add_argument("--as", dest="as_", choices=["task", "question", "idea", "adr"], help="what the slug names, when several kinds share it")
     s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR")
     s.add_argument("--spec", nargs="+", action="extend", default=[], metavar="SPEC")
     s.add_argument("--task", nargs="+", action="extend", default=[], metavar="TASK")
     s.add_argument("--blocks", nargs="+", action="extend", default=[], metavar="TASK")
+    s.add_argument("--areas", nargs="+", action="extend", default=[], metavar="AREA")
     s.add_argument("--amends", nargs="+", action="extend", default=[], metavar="ADR")
     s.add_argument("--supersedes", nargs="+", action="extend", default=[], metavar="ADR")
     s.set_defaults(fn=cmd_link)
 
-    s = sub.add_parser("dep", help="add or remove dependencies: TASK depends on PREREQs")
+    s = sub.add_parser("dep", help="add or remove dependencies: TASK (or an open idea) depends on PREREQs")
     s.add_argument("action", choices=["add", "rm"])
-    s.add_argument("task")
+    s.add_argument("task", help="a task, or an open idea: it is ready to plan once its prerequisites are done")
     s.add_argument("prereqs", nargs="+")
     s.set_defaults(fn=cmd_dep)
 
@@ -1843,7 +2018,27 @@ def main():
     s.add_argument("slug")
     s.set_defaults(fn=cmd_answer)
 
-    s = sub.add_parser("validate", help="check task and question files: frontmatter, dependencies form a DAG, references exist")
+    s = sub.add_parser("idea", help="record an idea for a later planning session: never startable, found by `sdd context` in its areas")
+    s.add_argument("slug")
+    s.add_argument("--title", required=True)
+    s.add_argument("--areas", nargs="+", action="extend", default=[], metavar="AREA", help="areas it belongs to, as for ADRs (`sdd areas`)")
+    s.add_argument("--after", nargs="+", action="extend", default=[], metavar="TASK", help="tasks that must be done before it can be planned")
+    s.add_argument("--task", nargs="+", action="extend", default=[], metavar="TASK", help="tasks it came up in or concerns")
+    s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR", help="architecture decisions it touches (file name without .md)")
+    s.set_defaults(fn=cmd_idea)
+
+    s = sub.add_parser("ideas", help="list open ideas, ready to plan first, then oldest: slug, state (ready, waiting on <tasks>, closed), title, areas, raised")
+    s.add_argument("--ready", action="store_true", help="only the open ideas whose prerequisites are done")
+    s.add_argument("--area", nargs="+", action="extend", default=[], metavar="AREA", help="only ideas in these areas (prefix match)")
+    s.add_argument("--all", action="store_true", help="include closed ideas")
+    s.set_defaults(fn=cmd_ideas)
+
+    s = sub.add_parser("close-idea", help="close an idea once its `## Outcome` says what planning made of it (planned, or dropped and why)")
+    s.add_argument("slug")
+    s.add_argument("--into", nargs="+", action="extend", default=[], metavar="ITEM", help="the tasks, ADRs and specs it was planned into")
+    s.set_defaults(fn=cmd_close_idea)
+
+    s = sub.add_parser("validate", help="check task, question and idea files: frontmatter, dependencies form a DAG, references exist")
     s.set_defaults(fn=cmd_validate)
 
     s = sub.add_parser("render", help="print the dependency graph as styled DOT (pipe to `dot -Tsvg`)")

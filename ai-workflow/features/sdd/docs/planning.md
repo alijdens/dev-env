@@ -11,12 +11,16 @@ Main is the only plan everyone can see; a checkout behind it shows tasks as uncl
 
 In local mode the data isn't shared, so there's nothing to sync.
 
+## Pick what to plan
+
+When the user names no feature, don't assume one: ask whether to plan something new or pick up a recorded idea (`overview.md`, "Ideas"). For an idea, list `sdd ideas --ready` grouped by area, a line each, and say in one line how many more wait on unfinished tasks (`sdd ideas`); one of those is planned only if the user insists, after saying what it waits on. The picked idea's Idea and Context are the feature description, and its areas, tasks and ADRs seed the reading list below.
+
 ## Load context
 
 A feature is designed on top of what was already decided and built, so before designing:
 
-1. Name the areas the feature touches (`sdd areas` lists the ones in use; pick from the goal's glossary and the feature description) and run `sdd context --area <areas> [--grep <key words>]`. It lists the foundation ADRs, the ADRs and specs in those areas, the tasks that used them (done ones show what already exists, in-progress ones what is being built) and the questions on them.
-2. Show the user the list in a few lines as the proposed reading, and let them add or drop items. Then read what's left: ADRs and specs in full, done tasks' Goal and Notes, answered questions' Answer (they often carry requirements), open questions so they aren't asked twice.
+1. Name the areas the feature touches (`sdd areas` lists the ones in use; pick from the goal's glossary and the feature description) and run `sdd context --area <areas> [--grep <key words>]`. It lists the foundation ADRs, the ADRs and specs in those areas, the tasks that used them (done ones show what already exists, in-progress ones what is being built), and the questions and ideas on them.
+2. Show the user the list in a few lines as the proposed reading, and let them add or drop items. Then read what's left: ADRs and specs in full, done tasks' Goal and Notes, answered questions' Answer (they often carry requirements), open questions so they aren't asked twice, open ideas the feature may cover, closed ones so a dropped idea isn't proposed again without its reason.
 3. Include ready tech-debt tasks in those areas (`sdd ready`): the feature may absorb or obsolete them.
 
 Say in one or two lines what prior decisions and work the design builds on before proposing anything.
@@ -53,13 +57,19 @@ Write an ADR only for decisions that are hard to reverse, span several component
 - `sdd questions` before planning: answered questions may already settle a design point, and open ones on related ADRs shouldn't be asked twice.
 - Answers that change a decision become a new ADR, and tasks that depended on the old one are re-planned. Until that happens each such task is held with a blocking question (`sdd ask replan-<slug> --title "Re-plan <slug> after <adr>" --blocks <slug> --arch <adr>`), so `sdd ready` leaves it out; re-planning it answers the question. A note in the task file holds nothing: workers find it only after claiming.
 
+## Ideas
+
+- Ask the user whether the plan should cover the open ideas in its areas; those it covers are closed with it.
+- A covered idea gets its Outcome (what it became, in a line or two) and `sdd close-idea <slug> --into <tasks and ADRs>`. One the user decides against gets the reason as Outcome and `sdd close-idea <slug>`. Only the user drops an idea.
+- What comes up but stays out of the plan's scope is recorded with `sdd idea` instead of growing the plan, with `--after` the tasks it must wait for.
+
 ## Steps
 
 1. Read `goal.md` and `principles.md` if they exist (`sdd doc list`), then design the feature following `../planning.md`. Say in one line which goal the feature serves; if it serves none, or works against a non-goal, raise that with the user before going further. Every design choice stays within the principles; wanting to break one is a question for the user, not a decision.
 2. Record each important decision with `sdd adr` and fill it in. Its Context names the goal or principle it follows from, when there is one, so a reader can tell a forced choice from a free one. Add `## Review checks` only for what reviewers of later changes must verify.
 3. Create the tasks with `sdd new`, referencing their ADRs and prerequisites, and fill them in.
-4. Record the open questions with `sdd ask` and fill in their Question and Context sections.
-5. Run `sdd validate` (frontmatter, prerequisites exist and form a DAG, ADR and question references exist, questions filled in). For a visual review: `sdd render | dot -Tsvg > graph.svg`.
+4. Record the open questions with `sdd ask` and fill in their Question and Context sections. Close the ideas the plan covers and record the ones it leaves out (see "Ideas").
+5. Run `sdd validate` (frontmatter, prerequisites exist and form a DAG, ADR and question references exist, questions and ideas filled in). For a visual review: `sdd render | dot -Tsvg > graph.svg`.
 6. In shared mode, the planning changes must be merged to main before any of the tasks is started: main is what claims are checked against. Once the user agrees to the plan, `sdd accept <adr>...` the new decisions and `sdd ship --title "Plan <feature>" --body "..." --merge` (without `--merge` when the user wants to read the PR first; the body follows `../pull-requests.md`). In local mode, the files are simply there.
 
 Re-planning later (splitting a task, changing dependencies) follows the same steps, including going to main first in shared mode.

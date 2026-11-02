@@ -4,6 +4,7 @@ The CLI is the lowest layer here, so these tests cover its behavior in detail; `
 reached because every PR-opening command runs with `--no-pr`.
 """
 import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
@@ -206,7 +207,7 @@ def test_rm_only_deletes_unreferenced_planned_tasks(repo):
 def test_validate_reports_inconsistencies(repo):
     run("new", "a", "--title", "A", cwd=repo)
     run("new", "b", "--title", "B", "--after", "a", cwd=repo)
-    assert run("validate", cwd=repo).stdout.endswith("ok: 2 tasks, 1 dependencies, 0 architecture decisions, 0 open questions\n")
+    assert run("validate", cwd=repo).stdout.endswith("ok: 2 tasks, 1 dependencies, 0 architecture decisions, 0 open questions, 0 open ideas\n")
 
     (repo / "docs/tasks/todo/b.md").write_text("---\ntitle: B\nafter: [a, ghost]\narch: [missing-adr]\n---\n")
     (repo / "docs/tasks/todo/.gitkeep").unlink()
@@ -421,7 +422,7 @@ def test_link_edits_questions_and_adrs_too(repo):
     assert "doesn't apply to a question" in fails("link", "q", "--spec", "s", cwd=repo)
     assert "doesn't apply to a task" in fails("link", "a", "--blocks", "b", cwd=repo)
     assert "can't amend itself" in fails("link", new, "--amends", new, cwd=repo)
-    assert "unknown task, question or architecture decision" in fails("link", "zzz", "--arch", old, cwd=repo)
+    assert "unknown task, question, idea or architecture decision" in fails("link", "zzz", "--arch", old, cwd=repo)
     assert "nothing to link" in fails("link", "a", cwd=repo)
     run("new", "q", "--title", "Task named like the question", cwd=repo)
     assert "pass --as task|question" in fails("link", "q", "--arch", new, cwd=repo)
@@ -458,6 +459,110 @@ def test_defer_hides_a_question_until_its_tasks_are_done(repo, tmp_path):
     run("start", "t", cwd=repo)
     run("done", "t", cwd=repo)
     assert run("questions", cwd=repo).stdout.startswith("q\topen\tQ")
+
+
+# --- ideas ---------------------------------------------------------------------------------
+
+
+def fill_idea(path, idea="SSO through the identity provider.", context="Came up in login; see auth.py.", outcome=""):
+    text = path.read_text().split("\n## Idea")[0]
+    path.write_text(f"{text}\n## Idea\n\n{idea}\n\n## Context\n\n{context}\n\n## Outcome\n\n{outcome}\n")
+
+
+def test_ideas_are_never_startable_and_wait_on_their_prerequisites(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    run("new", "login", "--title", "Login", cwd=repo)
+    path = Path(run("idea", "sso", "--title", "SSO", "--areas", "backend/auth", "--after", "login", "--task", "login", cwd=repo).stdout.strip())
+    assert path == tmp_path / "data/ideas/open/sso.md"
+    assert "areas: [backend/auth]\nafter: [login]\ntasks: [login]\narch: []\nraised: " in path.read_text()
+    fill_idea(path)
+    assert "already exists" in fails("idea", "sso", "--title", "x", cwd=repo)
+    assert "unknown task" in fails("idea", "other", "--title", "x", "--after", "zzz", cwd=repo)
+
+    assert [line.split("\t")[0] for line in run("ready", cwd=repo).stdout.splitlines()] == ["login"]
+    assert run("ideas", cwd=repo).stdout.startswith("sso\twaiting on login\tSSO\tbackend/auth\t20")
+    assert run("ideas", "--ready", cwd=repo).stdout == ""
+
+    fill_idea(Path(run("idea", "audit", "--title", "Audit", "--areas", "backend", cwd=repo).stdout.strip()))
+    fill_idea(Path(run("idea", "themes", "--title", "Themes", "--areas", "web", cwd=repo).stdout.strip()))
+    old = tmp_path / "data/ideas/open/themes.md"
+    old.write_text(old.read_text().replace("raised: 20", "raised: 19"))
+    assert [line.split("\t")[0] for line in run("ideas", cwd=repo).stdout.splitlines()] == ["themes", "audit", "sso"]
+    assert [line.split("\t")[0] for line in run("ideas", "--area", "backend", cwd=repo).stdout.splitlines()] == ["audit", "sso"]
+
+    run("start", "login", cwd=repo)
+    run("done", "login", cwd=repo)
+    assert run("ideas", "--ready", "--area", "backend/auth", cwd=repo).stdout.startswith("sso\tready\tSSO")
+
+
+def test_close_idea_needs_an_outcome_and_records_what_it_became(repo):
+    run("new", "login", "--title", "Login", cwd=repo)
+    path = Path(run("idea", "sso", "--title", "SSO", "--areas", "backend", cwd=repo).stdout.strip())
+    fill_idea(path)
+    assert "under `## Outcome` first" in fails("close-idea", "sso", cwd=repo)
+    assert "unknown task, architecture decision or spec" in fails("close-idea", "sso", "--into", "zzz", cwd=repo)
+
+    fill_idea(path, outcome="Planned as login.")
+    run("close-idea", "sso", "--into", "login", cwd=repo)
+    closed = repo / "docs/ideas/closed/sso.md"
+    assert not path.exists() and "into: [login]" in closed.read_text() and "closed: " in closed.read_text()
+    assert run("ideas", cwd=repo).stdout == ""
+    assert run("ideas", "--all", cwd=repo).stdout.startswith("sso\tclosed\tSSO")
+    assert "already closed" in fails("close-idea", "sso", cwd=repo)
+    assert "is closed" in fails("dep", "add", "sso", "login", cwd=repo)
+    run("validate", cwd=repo)
+
+
+def test_validate_requires_ideas_to_stand_alone(repo):
+    shutil.rmtree(repo / "docs/ideas")  # set up before ideas existed: their directories aren't required yet
+    run("validate", cwd=repo)
+
+    path = Path(run("idea", "sso", "--title", "SSO", cwd=repo).stdout.strip())
+    out = run("validate", cwd=repo, check=False).stdout
+    assert "empty `## Idea` section" in out and "empty `## Context` section" in out
+
+    fill_idea(path)
+    out = run("validate", cwd=repo).stdout
+    assert "no areas, so `sdd context` won't show it" in out and "1 open ideas" in out
+
+    path.write_text("---\ntitle: SSO\nareas: [x]\nafter: [ghost]\ntasks: []\narch: [nope]\ninto: [gone]\n---\n\n## Idea\n\nI\n\n## Context\n\nC\n")
+    out = run("validate", cwd=repo, check=False).stdout
+    for msg in ("unknown task ghost in after", "unknown architecture decision nope", "unknown task, architecture decision or spec gone in into"):
+        assert msg in out, msg
+
+    (repo / "docs/ideas/closed").mkdir(exist_ok=True)
+    path.rename(repo / "docs/ideas/closed/sso.md")
+    assert "closed without an `## Outcome`" in run("validate", cwd=repo, check=False).stdout
+
+
+def test_context_lists_the_ideas_in_the_areas_being_planned(repo):
+    auth = adr(repo, "sessions", "--title", "Sessions", "--areas", "backend/auth")
+    fill_idea(Path(run("idea", "sso", "--title", "SSO", "--areas", "backend/auth", cwd=repo).stdout.strip()))
+    fill_idea(Path(run("idea", "expiry", "--title", "Expiry", "--arch", auth, cwd=repo).stdout.strip()))
+    fill_idea(Path(run("idea", "themes", "--title", "Themes", "--areas", "web", cwd=repo).stdout.strip()), idea="Dark mode via redis-backed prefs.")
+
+    ideas = run("context", "--area", "backend", cwd=repo).stdout.split("ideas in these areas")[1]
+    assert "  sso\tready\tSSO" in ideas and "  expiry\tready\tExpiry" in ideas and "themes" not in ideas
+    assert "  themes\tready" in run("context", "--grep", "redis", cwd=repo).stdout.split("ideas in these areas")[1]
+
+
+def test_dep_and_link_edit_ideas_and_rm_keeps_their_prerequisites(repo):
+    for slug in ("a", "b"):
+        run("new", slug, "--title", slug.upper(), cwd=repo)
+    x = adr(repo, "x", "--title", "X")
+    path = Path(run("idea", "i", "--title", "I", cwd=repo).stdout.strip())
+
+    run("dep", "add", "i", "a", "b", cwd=repo)
+    assert "after: [a, b]" in path.read_text()
+    run("dep", "rm", "i", "b", cwd=repo)
+    assert "after: [a]" in path.read_text()
+    assert "unknown task" in fails("dep", "add", "i", "zzz", cwd=repo)
+    assert "ideas wait on a: i" in fails("rm", "a", cwd=repo)
+
+    run("link", "i", "--task", "b", "--arch", x, "--areas", "web", cwd=repo)
+    text = path.read_text()
+    assert "areas: [web]" in text and "tasks: [b]" in text and f"arch: [{x}]" in text
+    assert "doesn't apply to an idea" in fails("link", "i", "--blocks", "a", cwd=repo)
 
 
 def test_validate_flags_adrs_that_read_as_specs(repo):

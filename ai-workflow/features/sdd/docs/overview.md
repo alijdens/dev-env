@@ -30,6 +30,8 @@ tasks/in-progress/<slug>.md              claimed by someone
 tasks/done/2026-10-14/<slug>.md          history, grouped by the date `sdd done` ran
 questions/open/<slug>.md                 open questions, linked to the tasks and ADRs they concern
 questions/answered/<slug>.md             answered, kept as history
+ideas/open/<slug>.md                     ideas waiting for a planning session, by area
+ideas/closed/<slug>.md                   planned or dropped, kept as history
 ```
 
 A task's state is the directory its file is in, and its prerequisites are the `after: [...]` list in its frontmatter (`after: [a]` on `b`: `a` must be done before `b` starts), so each task is one self-contained file and branches that add or finish different tasks merge cleanly. A task that needs something an agent can't provide on its own (a credential, the user's go-ahead for a live run, access to an external system) says so in `needs: [...]` (`sdd new --needs user secret ...`); `sdd ready` prints it in its last column, `sdd show` as a line, and orchestrated runs skip such tasks unless asked for them. `sdd render` derives the dependency graph; done tasks keep their `after:` as history. Slugs are kebab-case and unique across all states; the slug is also the task's branch name and, in shared mode, how code refers to it.
@@ -69,3 +71,14 @@ Who does what:
 - **The reviewer** judges what the CLI can't: whether the Context is enough to answer from, and whether the PR made assumptions it didn't record as questions.
 - **The user** answers, usually in an `sdd-answer-questions` session (`answering.md`): one question at a time, in priority order, with context on request, and each answer converted into tasks or ADRs. An agent may draft an Answer from what the user says, but never decides on its own; the orchestrator in particular never answers questions.
 - **The planner** turns answers that change a decision into ADRs and re-plans blocked tasks if needed.
+
+## Ideas
+
+An idea is something worth designing later, not now: it comes up mid-task or mid-planning, and a conversation would forget it. It is neither a tech-debt task, which is scoped and ready to build, nor a question, which is a decision waiting on the user. `sdd idea <slug> --title "..." --areas <area>... [--after <task>...] [--task <slug>...] [--arch <adr>...]` creates `ideas/open/<slug>.md`. Ideas are never startable: `sdd ready` and orchestrated runs never see them; planning sessions do.
+
+- **Dependencies**: `after:` lists the tasks that must be done before the idea can be planned, since designing on code that doesn't exist yet gets redone. `sdd ideas` lists the open ones, ready to plan first (`--ready` only those, `--area` to filter, `--all` with the closed ones); `sdd dep add|rm <idea> <task>...` edits the list. Ideas wait only on tasks: an idea that needs another idea planned first is part of it.
+- **Found by area**: `sdd context` lists the ideas in the areas being planned (and those linking its ADRs or matching its words), so an idea surfaces when related work is designed even if nobody remembers it. Reuse the areas in `sdd areas`; `sdd validate` warns about an open idea without any.
+- **Stands alone**: like a question, it's read long after the conversation that raised it. **Idea** says what and why; **Context** says where it came up (pointers into the code, the task or ADR) and what's known so far, with sources. `sdd validate` fails while either is empty.
+- **Closed by planning**: when a plan covers it, **Outcome** says what it became and `sdd close-idea <slug> --into <task|adr|spec>...` moves it to `closed/`. An idea the user decides against gets the reason in Outcome and `sdd close-idea <slug>` without `--into`. Closed ideas stay as history, so `sdd context` shows a planner what was already planned or turned down.
+
+Anyone records them: the user by asking any session, a worker or reviewer for a follow-up that needs design, a planner for what stays out of the plan's scope. The idea file rides in the PR of the work that raised it; without one, `sdd ship` sends it on its own.
