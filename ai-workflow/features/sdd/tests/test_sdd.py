@@ -133,7 +133,7 @@ def test_new_list_show_and_ready_follow_dependencies(repo):
 
     assert "[WIP] fix [x]" in run("list", cwd=repo).stdout  # brackets in a title are not a list
     assert states(repo) == {"a": "todo", "b": "todo", "td": "tech-debt"}
-    assert set(run("ready", cwd=repo).stdout.split("\n")[:-1]) == {"a\ttodo\t[WIP] fix [x]\t1", "td\ttech-debt\tDebt\t0"}
+    assert set(run("ready", cwd=repo).stdout.split("\n")[:-1]) == {"a\ttodo\t[WIP] fix [x]\t1\t", "td\ttech-debt\tDebt\t0\t"}
     show = run("show", "b", cwd=repo).stdout
     assert "prereqs:\n  a\ttodo" in show and "ready: no, waiting on a" in show
     assert str(repo / "docs/arch" / f"{adr}.md") in run("show", "a", cwd=repo).stdout
@@ -147,7 +147,7 @@ def test_new_list_show_and_ready_follow_dependencies(repo):
 def test_ready_counts_the_work_waiting_behind_each_task(repo):
     for slug, after in (("a", []), ("b", ["a"]), ("c", ["b"]), ("d", [])):
         run("new", slug, "--title", slug.upper(), *(["--after", *after] if after else []), cwd=repo)
-    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t2\nd\ttodo\tD\t0\n"
+    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t2\t\nd\ttodo\tD\t0\t\n"
 
 
 def test_brief_prints_the_task_and_everything_linked_to_it(repo):
@@ -257,7 +257,7 @@ def test_open_blocking_question_holds_a_task_like_a_prerequisite(repo):
     assert path == repo / "docs/questions/open/per-key.md"
     assert f"tasks: [a]\narch: [{adr}]\nblocks: [b]\nasked: " in path.read_text()
 
-    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t0\n"
+    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t0\t\n"
     assert "ready: no, waiting on question per-key" in run("show", "b", cwd=repo).stdout
     assert "per-key\topen (blocks this task)" in run("show", "b", cwd=repo).stdout
     assert "per-key\topen\t" in run("show", "a", cwd=repo).stdout
@@ -277,7 +277,7 @@ def test_open_blocking_question_holds_a_task_like_a_prerequisite(repo):
     assert answered.is_file() and "answered: " in answered.read_text()
     assert run("questions", cwd=repo).stdout == ""
     assert "per-key\tanswered" in run("questions", "--all", cwd=repo).stdout
-    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t0\nb\ttodo\tB\t0\n"
+    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t0\t\nb\ttodo\tB\t0\t\n"
     assert "already answered" in fails("answer", "per-key", cwd=repo)
 
 
@@ -312,14 +312,16 @@ def test_validate_requires_questions_to_stand_alone(repo):
     assert "links to no task or architecture decision" in run("validate", cwd=repo).stdout
 
 
-def test_validate_warns_when_a_claimed_task_is_blocked_by_a_question(repo, tmp_path):
+def test_a_claimed_task_may_be_held_by_a_question_but_not_a_done_one(repo, tmp_path):
     run("init", "--local", tmp_path / "data", cwd=repo)
     run("new", "a", "--title", "A", cwd=repo)
     run("new", "b", "--title", "B", cwd=repo)
     run("start", "a", cwd=repo)
     fill_question(Path(run("ask", "q", "--title", "Q", "--blocks", "a", "b", "--task", "a", cwd=repo).stdout.strip()))
-    assert "a is in-progress but blocked by open questions: q" in run("validate", cwd=repo).stdout
+    assert "blocked by open questions" not in run("validate", cwd=repo).stdout  # held for a decision, by design
     assert "b is waiting on: question q" in fails("start", "b", cwd=repo)
+    run("done", "a", cwd=repo)
+    assert "a is done but blocked by open questions: q" in run("validate", cwd=repo).stdout
 
 
 # --- ADRs, specs and context ---------------------------------------------------------------
@@ -388,6 +390,64 @@ def test_link_adds_references_to_done_tasks(repo, tmp_path):
     assert "unknown spec" in fails("link", "t", "--spec", "nope", cwd=repo)
 
 
+def test_repeated_list_flags_accumulate(repo):
+    for slug in ("a", "b"):
+        run("new", slug, "--title", slug.upper(), cwd=repo)
+    x, y = adr(repo, "x", "--title", "X"), adr(repo, "y", "--title", "Y")
+    path = Path(run("ask", "q", "--title", "Q", "--task", "a", "--task", "b", "--arch", x, "--arch", y, cwd=repo).stdout.strip())
+    assert f"tasks: [a, b]\narch: [{x}, {y}]" in path.read_text()
+    run("new", "c", "--title", "C", "--after", "a", "--after", "b", cwd=repo)
+    assert "after: [a, b]" in (repo / "docs/tasks/todo/c.md").read_text()
+
+
+def test_link_edits_questions_and_adrs_too(repo):
+    for slug in ("a", "b"):
+        run("new", slug, "--title", slug.upper(), cwd=repo)
+    old, new = adr(repo, "old", "--title", "Old"), adr(repo, "new", "--title", "New")
+    run("accept", old, cwd=repo)
+    q = Path(run("ask", "q", "--title", "Q", "--task", "a", cwd=repo).stdout.strip())
+    fill_question(q)
+
+    run("link", "q", "--task", "b", "--blocks", "b", "--arch", old, cwd=repo)
+    assert f"tasks: [a, b]\narch: [{old}]\nblocks: [b]" in q.read_text()
+    assert "ready: no, waiting on question q" in run("show", "b", cwd=repo).stdout
+
+    run("link", new, "--amends", old, cwd=repo)
+    assert f"amends: [{old}]" in (repo / f"docs/arch/{new}.md").read_text()
+    old_text = (repo / f"docs/arch/{old}.md").read_text()
+    assert f"amended-by: [{new}]" in old_text and "status: accepted" in old_text
+    run("validate", cwd=repo)  # an accepted ADR takes frontmatter links
+
+    assert "doesn't apply to a question" in fails("link", "q", "--spec", "s", cwd=repo)
+    assert "doesn't apply to a task" in fails("link", "a", "--blocks", "b", cwd=repo)
+    assert "can't amend itself" in fails("link", new, "--amends", new, cwd=repo)
+    assert "unknown task, question or architecture decision" in fails("link", "zzz", "--arch", old, cwd=repo)
+    assert "nothing to link" in fails("link", "a", cwd=repo)
+    run("new", "q", "--title", "Task named like the question", cwd=repo)
+    assert "pass --as task|question" in fails("link", "q", "--arch", new, cwd=repo)
+    run("link", "q", "--as", "task", "--arch", new, cwd=repo)
+    assert f"arch: [{new}]" in (repo / "docs/tasks/todo/q.md").read_text()
+
+
+def test_needs_marks_tasks_an_agent_cannot_do_alone(repo):
+    run("new", "smoke", "--title", "Live smoke", "--needs", "user", "secret", cwd=repo)
+    run("new", "a", "--title", "A", cwd=repo)
+    assert "needs: [user, secret]" in (repo / "docs/tasks/todo/smoke.md").read_text()
+    assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t0\t\nsmoke\ttodo\tLive smoke\t0\tuser,secret\n"
+    assert "needs: user, secret" in run("show", "smoke", cwd=repo).stdout
+    assert "needs:" not in run("show", "a", cwd=repo).stdout
+
+
+def test_questions_since_lists_what_a_run_raised(shared):
+    fill_question(Path(run("ask", "before", "--title", "Before", "--task", "a", cwd=shared).stdout.strip()))
+    commit_all(shared, "ask before")
+    start = git("rev-parse", "HEAD", cwd=shared)
+    fill_question(Path(run("ask", "during", "--title", "During", "--task", "a", cwd=shared).stdout.strip()))
+    commit_all(shared, "ask during")
+    assert [l.split("\t")[0] for l in run("questions", "--since", start, cwd=shared).stdout.splitlines()] == ["during"]
+    assert "bad revision" in fails("questions", "--since", "nope", cwd=shared)
+
+
 def test_defer_hides_a_question_until_its_tasks_are_done(repo, tmp_path):
     run("init", "--local", tmp_path / "data", cwd=repo)
     run("new", "t", "--title", "T", cwd=repo)
@@ -403,9 +463,13 @@ def test_defer_hides_a_question_until_its_tasks_are_done(repo, tmp_path):
 def test_validate_flags_adrs_that_read_as_specs(repo):
     a = adr(repo, "big", "--title", "Big", "--areas", "x")
     path = repo / f"docs/arch/{a}.md"
-    path.write_text(path.read_text().replace("status: proposed", "status: accepted") + "filler\n" * 100)
+    path.write_text(path.read_text() + "filler\n" * 100)
     out = run("validate", cwd=repo).stdout
-    assert "over 100 lines" in out and "no alternatives considered" in out
+    assert "over 100 lines" in out and "no alternatives" not in out
+    # Accepted, the body is history: the length can't be fixed any more, so it isn't nagged about.
+    path.write_text(path.read_text().replace("status: proposed", "status: accepted"))
+    out = run("validate", cwd=repo).stdout
+    assert "over 100 lines" not in out and "no alternatives considered" in out
     path.write_text(path.read_text().replace("status: accepted", "status: done"))
     assert "status must be one of" in run("validate", cwd=repo, check=False).stdout
 
@@ -605,7 +669,7 @@ def test_done_in_the_code_repo_is_a_working_tree_move(shared):
     dest = run("done", "a", cwd=shared).stdout.strip()
     assert Path(dest).parent.parent.name == "done" and Path(dest).is_file()
     assert git("status", "--porcelain", cwd=shared) != ""
-    assert run("ready", cwd=shared).stdout == "b\ttodo\tB\t0\n"
+    assert run("ready", cwd=shared).stdout == "b\ttodo\tB\t0\t\n"
 
 
 def test_release_moves_a_claimed_task_back(shared, tmp_path):
@@ -663,6 +727,21 @@ def test_start_branch_switches_to_the_task_branch_in_a_clean_checkout(repo, tmp_
     (repo / "x").unlink()
     assert run("start", "a", "--branch", cwd=repo).stdout == "claimed a\non branch a from main\n"
     assert git("branch", "--show-current", cwd=repo) == "a"
+
+
+def test_start_branch_fails_instead_of_branching_from_a_stale_main(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    run("new", "a", "--title", "A", cwd=repo)
+    run("new", "b", "--title", "B", cwd=repo)
+    git("remote", "add", "origin", str(tmp_path / "missing.git"), cwd=repo)
+    err = fails("start", "a", "--branch", cwd=repo)
+    assert "could not fetch origin/main" in err and "stale main" in err
+    assert git("branch", "--show-current", cwd=repo) == "main"
+    assert states(repo)["a"] == "in-progress"  # the claim stands; only the branch is missing
+
+    git("remote", "remove", "origin", cwd=repo)
+    add_remote(repo, tmp_path / "remote.git")
+    assert run("start", "b", "--branch", cwd=repo).stdout == "claimed b\non branch b from origin/main\n"
 
 
 def test_start_branch_in_shared_mode_needs_the_claim_on_main(shared):
@@ -746,11 +825,29 @@ def test_blockers_are_the_questions_that_alone_hold_up_a_task(repo):
     assert run("blockers", cwd=repo).stdout.startswith("open: 3\nkey\t")
 
 
+def test_blockers_include_claimed_tasks_held_for_an_answer(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    for slug, after in (("a", []), ("b", ["a"]), ("c", [])):
+        run("new", slug, "--title", slug.upper(), *(["--after", *after] if after else []), cwd=repo)
+    run("start", "a", cwd=repo)
+    # The worker built `a` and found a decision only the user can make: the PR waits, and so does b.
+    fill_question(Path(run("ask", "shape", "--title", "Shape?", "--blocks", "a", "--task", "a", cwd=repo).stdout.strip()))
+    fill_question(Path(run("ask", "later", "--title", "Later?", "--blocks", "b", "--task", "b", cwd=repo).stdout.strip()))  # b waits on a anyway
+    out = run("blockers", cwd=repo).stdout.splitlines()
+    assert out == ["open: 2", "shape\tShape?\ta (in-progress)\t2\t" + out[1].split("\t")[-1]]
+    import json
+    row = json.loads(run("blockers", "--json", cwd=repo).stdout)["blockers"][0]
+    assert (row["blocks"], row["held"], row["downstream"]) == (["a"], ["a"], 2)
+    fill_question(tmp_path / "data/questions/open/shape.md", answer="Round.")
+    run("answer", "shape", cwd=repo)
+    assert run("blockers", cwd=repo).stdout == "no question alone blocks a task (1 open)\n"
+
+
 def test_blockers_main_reads_the_remote_branch_not_the_checkout(shared):
     # On the remote: `a` is ready and nothing blocks it. Locally, an unpushed question blocks it.
     fill_question(Path(run("ask", "q", "--title", "Q?", "--blocks", "a", "--task", "a", cwd=shared).stdout.strip()))
     assert run("blockers", cwd=shared).stdout == "open: 1\nq\tQ?\ta\t2\t" + run("blockers", cwd=shared).stdout.split("\t")[-1]
-    assert run("blockers", "--main", cwd=shared).stdout == "open: 0\n"
+    assert run("blockers", "--main", cwd=shared).stdout == "no question alone blocks a task (0 open)\n"
     commit_all(shared, "ask")
     git("push", "-q", "origin", "main", cwd=shared)
     assert run("blockers", "--main", cwd=shared).stdout.startswith("open: 1\nq\tQ?\ta\t2\t")

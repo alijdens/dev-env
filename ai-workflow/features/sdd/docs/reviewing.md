@@ -1,6 +1,8 @@
 # Task Workflow: Reviewing a Task's PR
 
-A review checks that a PR delivers its task as planned, and nothing else. It is read-only: report the findings, and don't fix, comment on, approve or merge the PR unless asked. If the PR isn't checked out, fetch it into a temporary worktree instead of switching the working copy. Read-only extends to the machine: don't remove or rebuild caches, containers or volumes that other agents' checks share; a probe you need to run goes in a scratch copy with a cache of its own.
+A review checks that a PR delivers its task as planned, and nothing else. It is read-only: report the findings, and don't fix, comment on, approve or merge the PR unless asked. If the PR isn't checked out, fetch its head into a detached temporary worktree (the review exception in the general guidelines), creating no branches or refs in the repo. Probes (a mutant, a build, a run) go in a fresh `mktemp -d` of their own with their own caches, never in a scratch directory other agents may use, and are removed afterwards: a tree mixed from two PRs builds nothing meaningful.
+
+The project's full check suite is the implementer's job and CI's, not the reviewer's: verify that the PR names the commit the checks ran on and that it is the head under review, and run only the targeted checks the findings need.
 
 When a check below is added or changed because something slipped through a review, the case goes in `lessons.md`, so the reason survives the edit.
 
@@ -18,6 +20,7 @@ When a check below is added or changed because something slipped through a revie
 - Every acceptance criterion is met by the diff, not just claimed in the description.
 - Every behavioral claim in the PR description, and every guarantee the task's Goal or an ADR states in words ("verified", "single-use", "never returned", "bounded"), is checked against the diff too: it maps to an observable artifact (a column, a flag, a response field, a code path with a test) or it is a finding. The criteria are the minimum, not the whole promise.
 - For each bound or limit the task, an ADR or the description claims (a max depth, a retry count, "queries bounded by ..."), find the test that exercises it at and past the boundary, and check what cached or memoized state the error path leaves behind: a bound that errors but keeps the work going isn't a bound.
+- A task far over the PR size target in `../pull-requests.md` is a planning finding (the task should have been split), not the implementer's: say so, and don't ask for a stack.
 - Anything the diff does beyond the task's goal is flagged: unrelated refactors, extra features, drive-by fixes. Out-of-scope follow-ups belong in tech-debt tasks (`sdd new <slug> --tech-debt`), not in the PR.
 - Implementation choices contradicting an ADR are flagged. Changing a decision needs a new ADR, not a quiet deviation, and not a question that leaves the code as is.
 - ADRs whose decisions the diff's shape follows from are linked in the task's `arch:` (`sdd context --grep` on the diff's key terms finds candidates). A missing link is a planning finding, fixed with `sdd link`.
@@ -66,7 +69,7 @@ Only when the diff touches authentication, authorization, sessions, tokens or se
 - An operation a dependent must compose into one transaction with its own writes, offered only as a self-contained call with no transaction-taking variant.
 - A return type or interface with no room for what a dependent must add (a bare principal where scopes or an origin will be needed): an additive result struct now saves changing every implementation later.
 - A response a dependent UI or agent will act on that doesn't carry the outcome it needs (a failed delivery answered as success, a retry that reports the previous attempt's timestamp).
-- A port or interface another todo task implements, changed by this PR without that task's criteria updated on main (see `orchestrating.md`, scope changes).
+- A port or interface another todo task implements, changed by this PR without that task's criteria updated: in this PR when that task is downstream of this one, on main otherwise (see `working.md`, step 5).
 
 ### References
 
@@ -101,7 +104,7 @@ A task left in the wrong state blocks the workflow: a task stuck in `in-progress
 
 ### Tests test the feature
 
-For each new or changed test, ask whether it would fail if the feature were broken. Flag tests that wouldn't:
+For each new or changed test, ask whether it would fail if the feature were broken. For every guard, bound or branch the task or the description claims is covered, check it the way `../testing.md` ("Prove a test can fail") says: remove the guarded line in your scratch copy and run the test; a test that still passes is a finding, and a probe that hangs means the test needs a bound. Flag tests that wouldn't fail:
 
 - The unit under test is itself mocked, or the mocks are configured to return the result the test then asserts.
 - Assertions only check that a mock was called, where the actual output or effect is observable.
@@ -130,14 +133,15 @@ Following `../testing.md`, flag tests, new or existing, that can be removed or m
 
 ## Re-reviews
 
-A round after fixes comes with the commit range of the fixes and the findings decided so far. Verify that each accepted finding is fixed, review the changed hunks with the checks above, and re-run `sdd validate`; don't re-review code the round didn't touch, and don't raise what was rejected. New findings are for regressions and for what the fixes introduced. The report still ends with the risk level, rated on the PR as it now stands.
+A round after fixes comes with the commit range of the fixes and the findings decided so far. Verify that each accepted finding is fixed, review the changed hunks with the checks above, and re-run `sdd validate`; don't re-review code the round didn't touch, and don't raise what was rejected. New findings are for regressions and for what the fixes introduced: say for each whether the fixes introduced it or it was there before, so the orchestrator can tell a loop that converges from one that doesn't. The report still ends with the risk level, rated on the PR as it now stands.
 
 ## Report
 
 List the findings grouped by check, most severe first, each with its file and line, what's wrong and a concrete suggestion. Say explicitly which checks passed, and which couldn't be done (e.g. the task can't be found), instead of leaving them out.
 
-End with the PR's risk level (`low`, `medium`, `high` or `critical`) and a one-line reason. It rates how bad it would be if the PR as it stands had a bug that slipped through, so open findings raise it and fixed ones don't count:
+End with the PR's risk level (`low`, `medium`, `high` or `critical`) and a one-line reason. It rates how bad it would be if the PR as it stands had a bug that slipped through, so open findings raise it and fixed ones don't count. State its two parts separately, so the same kind of change gets the same level from any reviewer:
 
-- The highest breaking change severity, whether planned or not: a planned DB migration is still `high`.
-- At least `high` for changes to authentication, authorization, payments, secrets, infrastructure or deletion of data.
-- Otherwise `low` for changes that are small, well tested and easy to revert, and `medium` for the rest.
+- The **floor**, from the change's category alone: the highest breaking change severity above, whether planned or not (a planned DB migration is still `high`), and at least `high` for changes to authentication, authorization, payments, secrets, infrastructure or deletion of data. It doesn't move with the quality of the PR; a merge policy that excludes it (`merge=medium` and a migration) does so on purpose.
+- The **residual**, your judgement of the PR as it stands: `low` for changes that are small, well tested and easy to revert, `medium` for the rest, higher with open findings.
+
+The level is the higher of the two.
