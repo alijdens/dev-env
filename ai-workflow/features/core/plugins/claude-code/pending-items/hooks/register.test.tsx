@@ -148,6 +148,32 @@ test('stored sessions untouched for longer than a transcript is kept are dropped
   }
 })
 
+test('resuming a session counts as using it, so garbage collection keeps it', async ($, on) => {
+  const now = 100 * DAY
+  const session = { id: 'old' }
+  engine(on, { session, now, store: { 'session:old': stored('old item', now - 31 * DAY) } })
+  const run = pendingCommand($)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  expect(await run()).toBe('1. old item')
+
+  await endSession($, session, 'resume', 'other')
+  await endSession($, session, 'resume', 'old')
+  expect(await run()).toBe('1. old item')
+})
+
+test('/resume into another session shows its items without waiting for a prompt', async ($, on) => {
+  const session = { id: 'new' }
+  engine(on, { session, store: { 'session:old': stored('old item', 99 * DAY) } })
+  on('classic.SessionStart', () => ({}))
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+
+  await endSession($, session, 'resume', 'old')
+  await $.classic.SessionStart({ source: 'resume', session_id: 'old' })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Waiting on you/ }))?.text).toContain('Waiting on you: old item')
+  await ui.unmount()
+})
+
 test('only the 50 most recently updated sessions are kept', async ($, on) => {
   const now = 100 * DAY
   const store: Record<string, unknown> = {}
