@@ -45,6 +45,8 @@ async function sync($: $): Promise<Pending> {
   } else {
     const stored = await $.store.get(KEY_PREFIX + sessionId)
     next = isStored(stored) ? { items: stored.items, nextId: stored.nextId, sessionId } : { ...EMPTY, sessionId }
+    // A resume counts as use: garbage collection, which runs right after, measures age from it.
+    if (next.items.length > 0) await persist($, next)
   }
   await update($, pending, () => next)
   return next
@@ -111,6 +113,13 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') await $.store.delete(KEY_PREFIX + e.sessionId)
     if (e.reason === 'clear' || e.reason === 'resume') await update($, pending, () => EMPTY)
+    return next(e)
+  })
+
+  // A /resume inside the running process starts the other session with no `session.start`, but with this
+  // one: load its items now, so the band shows them before the next prompt.
+  on('classic.SessionStart', async ($, e, next) => {
+    await sync($)
     return next(e)
   })
 

@@ -28,7 +28,7 @@ trap 'rm -f "$fetched" "$raw"' EXIT
 # One call for both: the first line is the url, the rest the body.
 gh pr view "$pr" "$@" --json body,url --template '{{.url}}{{"\n"}}{{.body}}' > "$raw"
 # https://<host>/<owner>/<repo>/pull/<n>, on github.com and GHES alike.
-repo_path="$(head -n1 "$raw" | sed -n 's#^https\?://[^/]*/\([^/]*\)/\([^/]*\)/pull/.*#\1/\2#p')"
+repo_path="$(head -n1 "$raw" | sed -nE 's#^https?://[^/]*/([^/]*)/([^/]*)/pull/.*#\1/\2#p')"
 if [[ -z "$repo_path" ]]; then
   echo "could not tell the repo from the PR url: $(head -n1 "$raw")" >&2
   exit 1
