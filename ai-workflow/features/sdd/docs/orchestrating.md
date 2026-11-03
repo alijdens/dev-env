@@ -22,6 +22,8 @@ Invoking the orchestrator authorizes merging every claim PR, whatever the policy
 
 `sdd root` must succeed. Keep the user's working copy untouched: give the orchestrator its own worktree at `origin/main` (e.g. `../<repo>-worktrees/orchestrator`) and refresh it with `git fetch` and a reset to `origin/main` before every pick, so `sdd ready` sees what main sees. Record the commit main was at when the run started: the report reads the questions raised since then from it.
 
+With a target, flag early what only the user can clear, so the run isn't stuck on it later. Before the first pick, if the stderr of `sdd ready --for <target>` names anything besides the run's own in-flight tasks, tell the user in one line, with each item and what it waits for. This is a notice, not a question; if the tool keeps a list of pending items for the user, add it there. Repeat it on a refresh only when that list changes.
+
 On every refresh, before resetting, diff the in-flight tasks' files and the specs they link between the old and new `origin/main` (`git diff <old> <new> -- <data root>/tasks/in-progress/ <data root>/specs/`). A planning session may have merged a change to a task, or to the feature spec, that a worker is implementing: forward the new definition to that worker with the same prompt rules as a scope change, and schedule a re-review of its PR. A task that was removed or moved out of `in-progress` by someone else is dropped from the run and reported. Also check whether a held task's question (below) has been answered: if so, it gets a fix round with the answer.
 
 ## Loop
