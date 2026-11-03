@@ -33,7 +33,7 @@ The sections below are the *maximum* structure, not a checklist. Include a secti
 
 Content rules that apply at every size:
 
-- **Describe the final state, not the PR's history.** No earlier iterations, what a bot flagged along the way, what the agent couldn't access, or who provided what.
+- **Describe the final state, not the PR's history.** No earlier iterations, what a bot flagged along the way, what the agent couldn't access (except in a screenshot placeholder, below), or who provided what.
 - **Don't restate the diff.** A file-by-file list of edits adds nothing; describe components and responsibilities only when the change spans enough of them that the diff alone doesn't show how they fit.
 - **Key decisions are for choices a reviewer might question.** Skip trivia (e.g. "the import stays because it's still used") and justifications for not doing things nobody would expect.
 
@@ -41,7 +41,13 @@ Content rules that apply at every size:
 
 When the change is something a user sees (a page, a component, a CLI's output, a rendered document) and a picture says more than a paragraph, show it: run the change and capture a screenshot, or a short recording for an interaction or an animation, and put it in the description, before/after for a change to something that already existed. Use whatever browser tooling the session has (a browser automation tool or extension that can open the running app and take screenshots or GIF recordings); start the app the way the repo's docs say and capture the real feature, not a mock. Crop to the relevant part and make sure no personal or private data is in the frame.
 
-Skip it when the change isn't visible or an image adds nothing (a copy tweak the title already states, a change with no observable difference). If no browser tooling is available or the app can't be run in the session, leave a clearly marked placeholder for the author instead of describing what the screenshot would show. Attach the capture to the PR, don't only save it locally. Use the code host's CLI if it can upload attachments; with the GitHub CLI, for example, reference the file in the body and pass it with `--attach`, which uploads it and rewrites the reference: `![The login error state](./login.png)` in the body, then `gh pr edit 23 --body-file body.md --attach ./login.png` (`gh pr create` takes the same flag). Otherwise use the browser tooling to open the PR page and add the file through its description editor. When the capture can't be attached, the placeholder names the local file and says why it wasn't attached: the error an upload gave, or that the session had neither a CLI that uploads nor browser access. The report says the same.
+Skip it when the change isn't visible or an image adds nothing (a copy tweak the title already states, a change with no observable difference). If no browser tooling is available or the app can't be run in the session, leave a clearly marked placeholder for the author instead of describing what the screenshot would show.
+
+Attach a capture to the PR, don't only save it locally:
+
+- **With a CLI that uploads attachments.** The GitHub CLI does with `--attach` (gh 2.99 or newer; not on GitHub Enterprise Server): reference the file in the body and pass it, and the reference is rewritten to the uploaded asset: `![The login error state](./login.png)` in the body, then `gh pr edit 23 --body-file body.md --attach ./login.png` (`gh pr create` takes the same flag). GitHub's body now differs from a local copy kept with `pull-pr-description` (below), so right after the push replace that file with it (`gh pr view 23 --json body --jq .body > <path>`) and re-run `pull-pr-description` (expect `unchanged`); otherwise the next `--body-file` push restores `./login.png` and breaks the image. A non-zero exit may still have updated the PR with the files that did upload: check it before retrying. If the flag is unknown or the host refuses the upload, treat the CLI as one that can't upload; don't upgrade or re-authenticate it.
+- **Otherwise, with browser tooling.** Upload the file in the PR page's description editor, copy the URL it inserts into your local body and push that the usual way, without saving the description in the page, which would overwrite edits made since you last synced it. If the upload doesn't go through on the first try (e.g. the file picker can't be driven), stop.
+- **When it can't be attached,** the placeholder names the local file and says why: the error the upload gave, or that the session had neither a CLI that uploads nor browser access. The report says the same.
 
 ### Formatting rules
 
