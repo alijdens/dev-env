@@ -9,22 +9,24 @@ When a check below is added or changed because something slipped through a revie
 ## Load context
 
 1. Find the task: the PR's branch is named after its slug, and in shared mode the title carries it too. If neither matches a task, ask instead of guessing.
-2. `sdd brief <slug> --review`, on the PR's branch so what the PR added counts, prints in one go: the task's state, prerequisites and dependents; the task file, its ADRs and specs and the questions linked to it, in full; `goal.md` and `principles.md` when they exist; the dependents' task files (see "Dependents can build on it"); and the project's review checks (`sdd checks --task <slug>`). Read it instead of opening those files one by one.
+2. `sdd brief <slug> --review`, on the PR's branch so what the PR added counts, prints in one go: the task's state, prerequisites and dependents; the task file, its ADRs, business rules and specs and the questions linked to it, in full; `goal.md` and `principles.md` when they exist; the dependents' task files (see "Dependents can build on it"); and the project's review checks (`sdd checks --task <slug>`). Read it instead of opening those files one by one.
 3. Read the PR description and the full diff against the base branch.
-4. If the diff touches an area outside the task's ADRs and specs (`sdd areas`), add its checks with `sdd checks --area <area>`.
+4. If the diff touches an area outside the task's ADRs, rules and specs (`sdd areas`), add its checks with `sdd checks --area <area>`. If it touches code that cites a business rule the task doesn't link (`sdd context --path <changed files>`), read that rule too: it holds whatever the task's areas.
 
 ## Checks
 
 ### Scope matches the task
 
 - Every acceptance criterion is met by the diff, not just claimed in the description.
+- The change follows the feature spec the task links. Its Shape may be adjusted in the PR, with the spec updated and the PR saying why; a change to How it works, a rule or a decision is the user's call: a finding, resolved by a question or a planning change on main.
+- Every business rule the task links, and every one cited by the code the diff touches, still holds: a new path that reaches the same data without going through the place that enforces the rule, or that weakens its test, is a finding.
 - Every behavioral claim in the PR description, and every guarantee the task's Goal or an ADR states in words ("verified", "single-use", "never returned", "bounded"), is checked against the diff too: it maps to an observable artifact (a column, a flag, a response field, a code path with a test) or it is a finding. The criteria are the minimum, not the whole promise.
 - For each bound or limit the task, an ADR or the description claims (a max depth, a retry count, "queries bounded by ..."), find the test that exercises it at and past the boundary, and check what cached or memoized state the error path leaves behind: a bound that errors but keeps the work going isn't a bound.
-- A task far over the PR size target in `../pull-requests.md` is a planning finding (the task should have been split), not the implementer's: say so, and don't ask for a stack.
+- A task far over the PR size target in `../pull-requests.md` is a planning finding (the task should have been split), not the implementer's: say so. A split the implementer made (`working.md`) is checked instead: the cut follows from the feature spec, rules or ADRs, the PR leaves main working and delivers its share whole, every moved criterion is in the new task word for word, the new task carries the same links, and every dependent that needs the moved part now waits on it. A cut that only the PR's convenience explains is a finding: where to split was the user's call.
 - Anything the diff does beyond the task's goal is flagged: unrelated refactors, extra features, drive-by fixes. Out-of-scope follow-ups belong in tech-debt tasks (`sdd new <slug> --tech-debt`), or in ideas (`sdd idea`) when they need designing first, not in the PR.
-- Implementation choices contradicting an ADR are flagged. Changing a decision needs a new ADR, not a quiet deviation, and not a question that leaves the code as is.
-- ADRs whose decisions the diff's shape follows from are linked in the task's `arch:` (`sdd context --grep` on the diff's key terms finds candidates). A missing link is a planning finding, fixed with `sdd link`.
-- The PR doesn't edit an accepted ADR's body (`sdd validate` fails on it); errata lines and new ADRs with `--amends`/`--supersedes` are the only ways to change one. Specs the change affects are updated in the PR and listed in the task's `spec:`.
+- Implementation choices contradicting an ADR or a business rule are flagged. Changing one needs a new record, not a quiet deviation, and not a question that leaves the code as is.
+- ADRs and business rules the diff's shape follows from are linked in the task's `arch:` and `rules:` (`sdd context --grep` on the diff's key terms, or `--path` on the files it touches, finds candidates). A missing link is a planning finding, fixed with `sdd link`.
+- The PR doesn't edit an accepted ADR's or rule's body (`sdd validate` fails on it); errata lines and new records with `--amends`/`--supersedes` are the only ways to change one. Specs the change affects are updated in the PR and listed in the task's `spec:`.
 
 ### Serves the goal, respects the principles
 
@@ -35,9 +37,9 @@ Only when `goal.md` and `principles.md` exist (`sdd doc list`); say which were a
 
 ### Project review checks
 
-Each bullet `sdd checks` printed is verified against the diff like an acceptance criterion, and reported by the ADR or spec it comes from. A check the diff can't meet because the decision no longer fits is a finding, not a reason to skip it: the fix is a new ADR.
+Each bullet `sdd checks` printed is verified against the diff like an acceptance criterion, and reported by the ADR, business rule or spec it comes from. A check the diff can't meet because the decision or rule no longer fits is a finding, not a reason to skip it: the fix is a new record.
 
-When something slipped through a review and a project-specific check would have caught it, add the bullet to the `## Review checks` of the ADR or spec it belongs to (an accepted ADR takes that edit), the way `lessons.md` does for these generic checks. A check that doesn't fit any ADR or spec's areas is a sign the rule is a principle, or the thing needs a spec.
+When something slipped through a review and a project-specific check would have caught it, add the bullet to the `## Review checks` of the ADR, business rule or spec it belongs to (an accepted record takes that edit), the way `lessons.md` does for these generic checks. A check that doesn't fit any record or spec's areas is a sign the rule is a principle, or the thing needs a spec.
 
 ### No unplanned breaking changes
 
@@ -76,10 +78,10 @@ Only when the diff touches authentication, authorization, sessions, tokens or se
 In shared mode:
 
 - The PR title has the slug, and the description links the task file and its ADRs (see `../pull-requests.md`).
-- ADRs added by the PR are listed in the task's `arch:` frontmatter.
-- Code references follow the rule in `working.md`: an `adr:` or `task:` reference is required where the code's shape follows from a decision a reader would otherwise question, and is noise anywhere else. Flag both missing and gratuitous ones, and check that each referenced ADR or task exists.
+- ADRs and business rules added by the PR are listed in the task's `arch:` and `rules:` frontmatter.
+- Code references follow `working.md`: an `adr:`, `rule:` or `task:` reference is required where the code's shape follows from a decision a reader would otherwise question or where it enforces a business rule, and is noise anywhere else. Flag both missing and gratuitous ones; `sdd validate` warns about references to records that don't exist or are superseded.
 
-In local mode it is the opposite: flag any mention of task slugs, ADRs or the workflow in code, commits, branch-external docs or the PR title and description. The branch name is exempt: it is the slug by design (see `working.md`).
+In local mode it is the opposite: flag any mention of task slugs, ADRs, business rules or the workflow in code, commits, branch-external docs or the PR title and description. The branch name is exempt: it is the slug by design (see `working.md`).
 
 ### Task state
 
