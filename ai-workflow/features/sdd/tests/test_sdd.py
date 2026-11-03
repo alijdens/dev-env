@@ -152,6 +152,54 @@ def test_ready_counts_the_work_waiting_behind_each_task(repo):
     assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t2\t\nd\ttodo\tD\t0\t\n"
 
 
+def test_ready_for_a_target_starts_its_longest_chain_first(repo):
+    # a0 has less work behind it than b but a longer chain to t; x and b's extra work aren't on the way to t.
+    for slug, after in (("a0", []), ("a1", ["a0"]), ("a", ["a1"]), ("b", []), ("b1", ["b"]), ("b2", ["b"]), ("b3", ["b"]),
+                        ("t", ["a", "b1", "b2", "b3"]), ("x", []), ("bx1", ["b"]), ("bx2", ["b"])):
+        run("new", slug, "--title", slug.upper(), *(["--after", *after] if after else []), cwd=repo)
+    r = run("ready", "--for", "t", cwd=repo)
+    assert r.stdout == "a0\ttodo\tA0\t3\t\t4\nb\ttodo\tB\t4\t\t3\n"
+    assert r.stderr == ""
+    assert run("ready", "--for", "a0", cwd=repo).stdout == "a0\ttodo\tA0\t0\t\t1\n"
+    assert "unknown task" in fails("ready", "--for", "zzz", cwd=repo)
+    assert "unknown task" in fails("ready", "--for", "", cwd=repo)
+
+
+def test_ready_for_a_target_names_what_finishing_ready_tasks_will_not_free(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    for slug, after, extra in (("a", [], []), ("b", [], ["--needs", "user"]), ("c", [], []), ("d", ["c"], []), ("t", ["a", "b", "d"], [])):
+        run("new", slug, "--title", slug.upper(), *(["--after", *after] if after else []), *extra, cwd=repo)
+    fill_question(Path(run("ask", "q", "--title", "Q", "--task", "d", "--blocks", "d", cwd=repo).stdout.strip()))
+    run("start", "a", cwd=repo)
+    (tmp_path / "data/tasks/todo/c.md").write_text((tmp_path / "data/tasks/todo/c.md").read_text().replace("after: []", "after: [gone]"))
+    r = run("ready", "--for", "t", cwd=repo)
+    assert [line.split("\t")[0] for line in r.stdout.splitlines()] == ["b"]
+    assert r.stderr == "t also waits on: a (in-progress); b (needs user); c (unknown prerequisite gone); d (question q)\n"
+    (tmp_path / "data/tasks/todo/c.md").write_text((tmp_path / "data/tasks/todo/c.md").read_text().replace("after: [gone]", "after: []"))
+    assert [line.split("\t")[0] for line in run("ready", "--for", "t", cwd=repo).stdout.splitlines()] == ["c", "b"]
+    run("done", "a", cwd=repo)
+    run("start", "b", cwd=repo)
+    run("done", "b", cwd=repo)
+    assert run("ready", "--for", "t", cwd=repo).stderr == "t also waits on: d (question q)\n"
+    assert run("ready", "--for", "a", cwd=repo).stderr == "a is already done\n"
+    run("start", "c", cwd=repo)
+    assert run("ready", "--for", "c", cwd=repo).stderr == "c itself: in-progress\n"
+
+
+def test_ready_for_a_target_takes_the_longest_of_several_paths_and_stops_at_done_tasks(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    # r reaches t through a -> c and through b: its chain is the longer path, not their sum.
+    for slug, after in (("r", []), ("a", ["r"]), ("b", ["r"]), ("c", ["a"]), ("t", ["b", "c"]), ("p", []), ("m", []), ("u", ["m"])):
+        run("new", slug, "--title", slug.upper(), *(["--after", *after] if after else []), cwd=repo)
+    assert run("ready", "--for", "t", cwd=repo).stdout == "r\ttodo\tR\t4\t\t4\n"
+    # A done task keeps its `after:` as history: what it once waited on isn't on the way to u.
+    run("start", "m", cwd=repo)
+    run("done", "m", cwd=repo)
+    done_m = next((tmp_path / "data/tasks/done").glob("*/m.md"))
+    done_m.write_text(done_m.read_text().replace("after: []", "after: [p]"))
+    assert run("ready", "--for", "u", cwd=repo).stdout == "u\ttodo\tU\t0\t\t1\n"
+
+
 def test_brief_prints_the_task_and_everything_linked_to_it(repo):
     run("adr", "store", "--title", "Store", cwd=repo)
     adr = next((repo / "docs/arch").glob("*-store.md"))

@@ -1375,12 +1375,62 @@ def cmd_ready(args):
     tasks, questions = proj.tasks(), proj.questions()
     g = Graph.from_tasks(tasks)
     ready = [s for s, t in tasks.items() if t.state in STARTABLE and not not_ready(g, s, tasks, questions)]
-    # The last column counts the tasks waiting behind each one, transitively, so whoever picks
-    # the next task can start the one that frees the most work.
-    behind = {s: len(downstream(g, [s])) - 1 for s in ready}
-    for slug in sorted(ready, key=lambda s: (-behind[s], s)):
+    if args.target is not None:
+        ready, behind, chain = toward(proj, g, tasks, questions, ready, args.target)
+        order = lambda s: (-chain[s], -behind[s], s)
+    else:
+        # The tasks waiting behind each one, transitively, so whoever picks the next task can
+        # start the one that frees the most work.
+        behind = {s: len(downstream(g, [s])) - 1 for s in ready}
+        order = lambda s: (-behind[s], s)
+    for slug in sorted(ready, key=order):
         t = tasks[slug]
-        print("\t".join([slug, t.state, t.meta.get("title", ""), str(behind[slug]), ",".join(t.meta.get("needs") or [])]))
+        row = [slug, t.state, t.meta.get("title", ""), str(behind[slug]), ",".join(t.meta.get("needs") or [])]
+        print("\t".join(row + ([str(chain[slug])] if args.target is not None else [])))
+
+
+def toward(proj, g, tasks, questions, ready, target):
+    """The ready tasks the target still waits on, with the work waiting behind each on the way to
+    it and the unfinished tasks on its longest chain to it, target included.
+
+    All of the target's unfinished prerequisites must be done before it starts, so the order that
+    gets there soonest starts the longest chain first. Prints to stderr what the closure waits on
+    that finishing ready tasks won't free: open questions, `needs`, work already in progress, unknown
+    prerequisites. Assumes the graph has no cycle."""
+    t = proj.get(target, tasks)
+    if t.state == "done":
+        print(f"{target} is already done", file=sys.stderr)
+        return [], {}, {}
+    closure, stack = set(), [target]
+    while stack:
+        s = stack.pop()
+        if s not in closure and s in tasks and tasks[s].state != "done":
+            closure.add(s)
+            stack.extend(g.prereqs(s))
+    chain = {}
+
+    def length(s):
+        if s not in chain:
+            chain[s] = 1 if s == target else 1 + max(length(d) for d in g.dependents(s) if d in closure)
+        return chain[s]
+
+    ready = [s for s in ready if s in closure]
+    behind = {s: len(downstream(g, [s]) & closure) - 1 for s in ready}
+    for s in ready:
+        length(s)
+    stuck = []
+    for s in sorted(closure):
+        reasons = ([f"question {q}" for q in open_blockers(questions, s)] + [f"needs {n}" for n in tasks[s].meta.get("needs") or []]
+                   + [f"unknown prerequisite {p}" for p in g.prereqs(s) if p not in tasks])
+        if tasks[s].state == "in-progress":
+            reasons.append("in-progress")
+        if reasons and s == target:
+            print(f"{target} itself: {', '.join(reasons)}", file=sys.stderr)
+        elif reasons:
+            stuck.append(f"{s} ({', '.join(reasons)})")
+    if stuck:
+        print(f"{target} also waits on: " + "; ".join(stuck), file=sys.stderr)
+    return ready, behind, chain
 
 
 def cmd_show(args):
@@ -2152,6 +2202,7 @@ def main():
     s.set_defaults(fn=cmd_list)
 
     s = sub.add_parser("ready", help="list todo/tech-debt tasks whose prerequisites are all done: slug, state, title, tasks waiting behind it, needs")
+    s.add_argument("--for", dest="target", metavar="SLUG", help="only SLUG and the ones it waits on, longest chain to SLUG first; adds that chain's length as a last column, counts only the work waiting on the way to SLUG, and prints to stderr what else holds it up")
     s.set_defaults(fn=cmd_ready)
 
     s = sub.add_parser("show", help="show a task's state, file, dependencies, architecture decisions and business rules")
