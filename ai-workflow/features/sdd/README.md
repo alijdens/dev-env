@@ -5,7 +5,24 @@ An opt-in, per-project workflow for features too big for one PR. Agents record t
 
 It needs `python3` (3.9+) and, for shared mode, `gh` logged in to the repo's GitHub host; `graphviz` (`dot`) is optional, for rendering the dependency graph.
 
-You drive it by asking your agent; the installed skills and the `sdd` CLI do the rest:
+You drive it by asking your agent; the installed skills and the `sdd` CLI do the rest. A typical sequence:
+
+```text
+# 1. Once per repo: pick the mode, optionally write the goal and principles
+/sdd-setup-task-workflow
+
+# 2. Per feature: design it into a spec, ADRs, rules and tasks (in shared mode, merge its PR)
+/sdd-planning add rate limiting to the API
+
+# 3. In a new session: run the tasks, optionally only the path to a target task
+/sdd-orchestrate 3 merge=low for=add-rate-limit-middleware
+
+# 4. Answer the open questions: in another session while the run goes on (held PRs pick
+#    the answers up), or in the orchestrator's session once it reports
+/sdd-answer-questions
+```
+
+Step by step:
 
 1. **Set up** a repo once: "set up the task workflow". Pick a mode:
    - **Shared**, for repos you own or collaborate on: the data lives in the repo (or a separate one), and `AGENTS.md` gets a section telling agents about it.
