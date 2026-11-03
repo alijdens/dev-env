@@ -144,7 +144,7 @@ export const register: Register = on => {
       isDeferred: false,
     })
     if (e.isInteractive) {
-      await $.command.register({ name: 'pending', description: 'Pick a pending item to work on with the model, or all one at a time; `/pending work` starts on all directly, `/pending done <id>` drops one, `/pending clear` all.', argumentHint: '[work | done <id> | clear]' })
+      await $.command.register({ name: 'pending', description: 'Pick a pending item to work on with the model, or all one at a time; `/pending all` starts on all directly, `/pending done <id>` drops one, `/pending clear` all.', argumentHint: '[all | done <id> | clear]' })
     }
     await sync($)
     await collectGarbage($)
@@ -206,7 +206,7 @@ export const register: Register = on => {
   on('command.run', { command: 'pending' }, async ($, e) => {
     const [verb, arg] = (e.args ?? '').trim().split(/\s+/)
     const current = await sync($)
-    if (verb === 'work') {
+    if (verb === ALL) {
       if (current.items.length === 0) return { text: 'Nothing pending.' }
       // The engine refuses a submit from a command.run hook, which holds the turn the prompt would wait on.
       void $.clock.sleep(0).then(() => work($, current.items, ALL))
