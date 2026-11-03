@@ -200,6 +200,17 @@ def test_ready_for_a_target_takes_the_longest_of_several_paths_and_stops_at_done
     assert run("ready", "--for", "u", cwd=repo).stdout == "u\ttodo\tU\t0\t\t1\n"
 
 
+def test_ready_reports_a_dependency_cycle_instead_of_crashing(repo):
+    for slug, after in (("a", []), ("b", ["a"]), ("t", ["b"]), ("x", [])):
+        run("new", slug, "--title", slug.upper(), *(["--after", *after] if after else []), cwd=repo)
+    path = repo / "docs/tasks/todo/a.md"
+    path.write_text(path.read_text().replace("after: []", "after: [b]"))  # a hand edit; `sdd dep add` rejects it
+    r = run("ready", cwd=repo)
+    assert r.stdout == "x\ttodo\tX\t0\t\n"
+    assert "dependency cycle: a -> b -> a" in r.stderr
+    assert fails("ready", "--for", "t", cwd=repo) == "sdd: dependency cycle: a -> b -> a\n"
+
+
 def test_brief_prints_the_task_and_everything_linked_to_it(repo):
     run("adr", "store", "--title", "Store", cwd=repo)
     adr = next((repo / "docs/arch").glob("*-store.md"))

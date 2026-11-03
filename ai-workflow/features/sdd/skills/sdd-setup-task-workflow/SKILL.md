@@ -21,6 +21,10 @@ Right after a first `sdd init`, offer to write `goal.md` and `principles.md`, an
 Re-running `sdd init` (or `sdd init --local`) without a path keeps the current one. It recreates missing state directories and their `.gitkeep` files, and in shared mode rewrites the section between `<!-- sdd:start -->` and `<!-- sdd:end -->` in the agent file with the current instructions. Passing a path moves the configuration to it; it doesn't move existing data.
 
 
+## CI
+
+In shared mode, once the layout is in place, suggest a CI step running `sdd validate` on pull requests and on pushes to main. Each branch's own checks can't catch everything: two branches can each add a valid dependency that only forms a cycle once both are merged, and a cycle means the tasks in it can never start. It also catches hand edits and broken links between tasks, ADRs, rules and specs. The job needs Python 3, git, and the `sdd` script (a single file); ask the user how CI should get it. Have it fetch the main branch too (e.g. `fetch-depth: 0`): without `origin/main`, the check that accepted ADRs and rules weren't rewritten is skipped. Add the step only if the user agrees.
+
 ## Verifying
 
 `sdd root` shows the data root and mode; `sdd doc list` the project docs' status; `sdd validate` checks the data.
