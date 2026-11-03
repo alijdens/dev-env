@@ -21,20 +21,24 @@ const BAND = {
 const DAY = 24 * 60 * 60 * 1000
 
 // `session.id` is mutable so a test can move the process to another session, as /clear and /resume do.
-function engine(on: On, { session = { id: 's1' }, store = {}, now = 100 * DAY, above }: { session?: { id: string }; store?: Record<string, unknown>; now?: number; above?: (on: On) => void } = {}) {
+// `panes` records the picker's opens and closes; `isPlaced` says whether a surface draws it.
+function engine(on: On, { session = { id: 's1' }, store = {}, now = 100 * DAY, above, isPlaced = false, panes = [] }: { session?: { id: string }; store?: Record<string, unknown>; now?: number; above?: (on: On) => void; isPlaced?: boolean; panes?: string[] } = {}) {
   // Hooks of the test's that must see calls before the mocks answer them.
   above?.(on)
   mock.store(on, store)
-  mock.clock(on, { now })
+  const clock = mock.clock(on, { now })
   on('session.id', () => ({ value: session.id }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.register', (_, e) => ({ value: { tool: `mcp__pending-items__${e.name}` } }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('ui.open', (_, e) => (panes.push(`open ${e.id}`), { value: isPlaced ? { isPlaced: true as const } : { isPlaced: false as const, reason: 'no surface places panes' } }))
+  on('ui.close', (_, e) => (panes.push(`close ${e.id}`), { value: undefined }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('ui.render', ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>engine</Text>
   })
+  return clock
 }
 
 test('items the model adds show above the prompt until resolved', async ($, on) => {
@@ -48,7 +52,7 @@ test('items the model adds show above the prompt until resolved', async ($, on) 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     const row = await ui.find({ type: 'Text', text: /waiting on you/ })
-    expect(row?.text).toContain('2 waiting on you: Approve merging PR 214')
+    expect(row?.text).toContain('2 items waiting on you: Approve merging PR 214')
     expect(row?.text).toContain('+1 more')
     await ui.unmount()
   }
@@ -71,8 +75,9 @@ test('with nothing pending the band is left to the engine', async ($, on) => {
   await ui.unmount()
 })
 
-test('/pending lists, resolves and clears items', async ($, on) => {
-  engine(on)
+test('/pending lists the items where the picker cannot be shown, resolves and clears them', async ($, on) => {
+  const panes: string[] = []
+  engine(on, { panes })
   const run = (args = '') => $.command.run({ command: 'pending', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   expect((await run()).text).toBe('Nothing pending.')
@@ -80,6 +85,7 @@ test('/pending lists, resolves and clears items', async ($, on) => {
   await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Approve merging PR 214' })
   await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Pick the storage option' })
   expect((await run()).text).toBe('1. Approve merging PR 214\n2. Pick the storage option')
+  expect(panes).toEqual(['open pending', 'close pending'])
   expect((await run('done 1')).text).toBe('Resolved 1.')
   expect((await run('done 9')).text).toContain('No pending item 9')
   expect((await run('clear')).text).toBe('Cleared 1 pending item.')
@@ -219,21 +225,96 @@ test('items a hot reload kept from before they were persisted stay, and get stor
   expect(writes).toEqual(['set'])
 })
 
-test('/pending work drafts a prompt to go through the items one by one', async ($, on) => {
-  engine(on)
-  const filled: string[] = []
-  on('prompt.fill', (_, e) => (filled.push(e.text), { isFilled: true }))
+const PICKER = {
+  plugin: 'pending-items',
+  component: 'Pane',
+  requestId: 'pending',
+  surface: 'terminal',
+  props: { title: 'Pending items', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 10 }, view: {} },
+} as const
+
+function submissions(on: On) {
+  const submitted: string[] = []
+  on('prompt.submit', (_, e) => (submitted.push(e.text), { text: e.text }))
+  return submitted
+}
+
+test('/pending work starts on the items one at a time', async ($, on) => {
+  const clock = engine(on)
+  const submitted = submissions(on)
   const run = pendingCommand($)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   expect(await run('work')).toBe('Nothing pending.')
 
   await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Approve merging PR 214' })
   await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Pick the storage option' })
-  expect(await run('work')).toContain('is in the input box')
-  expect(filled).toHaveLength(1)
-  expect(filled[0]).toContain('one item at a time, in this order:\n1. Approve merging PR 214\n2. Pick the storage option')
+  await run('work')
+  await clock.advance(0)
+  expect(submitted).toHaveLength(1)
+  expect(submitted[0]).toContain('(the `list` tool of pending-items), one item at a time')
   // Working on them doesn't resolve them: the model does, once each is answered.
   expect(await run()).toBe('1. Approve merging PR 214\n2. Pick the storage option')
+})
+
+test('/pending opens a picker to work on one item or all of them', async ($, on) => {
+  const panes: string[] = []
+  engine(on, { isPlaced: true, panes })
+  const submitted = submissions(on)
+  const run = pendingCommand($)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Approve merging PR 214' })
+  await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Pick the storage option' })
+
+  expect(await run()).toBeUndefined()
+  const options = [
+    { value: 'all', label: 'All, one at a time' },
+    { value: '1', label: '1. Approve merging PR 214' },
+    { value: '2', label: '2. Pick the storage option' },
+  ]
+  const desktop = await $.ui.mount({ ...PICKER, surface: 'desktop' })
+  expect((await desktop.find({ type: 'Select', key: 'item' }))?.props.options).toEqual(options)
+  await desktop.unmount()
+  // The mobile app draws no Select: the options are buttons there.
+  const mobile = await $.ui.mount({ ...PICKER, surface: 'mobile' })
+  expect((await mobile.findAll({ type: 'Button' })).map(b => b.text)).toEqual(options.map(o => o.label))
+  await mobile.unmount()
+
+  const ui = await $.ui.mount(PICKER)
+  await ui.select({ key: 'item', value: '2' })
+  await ui.unmount()
+  expect(panes).toEqual(['open pending', 'close pending'])
+  expect(submitted).toEqual([expect.stringContaining('work on pending item 2: Pick the storage option')])
+
+  await run()
+  const onMobile = await $.ui.mount({ ...PICKER, surface: 'mobile' })
+  await onMobile.press({ key: 'all' })
+  await onMobile.unmount()
+  expect(submitted[1]).toContain('(the `list` tool of pending-items), one item at a time')
+})
+
+test('the list tool gives the model each item with its age and context', async ($, on) => {
+  const clock = engine(on)
+  const submitted = submissions(on)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const list = async () => (await $.tool.call({ tool: 'mcp__pending-items__list' })).result
+  expect(await list()).toBe('Nothing pending.')
+
+  await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Approve merging PR 214' })
+  await clock.advance(90 * 60_000)
+  await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Pick the storage option', context: 'SQLite: one file, no server.\nPostgres: needs the shared instance.' })
+  await clock.advance(5 * 60_000)
+  expect(await list()).toBe('1. Approve merging PR 214 (added 1h ago)\n2. Pick the storage option (added 5m ago)\n   SQLite: one file, no server.\n   Postgres: needs the shared instance.')
+
+  // The context stays out of the picker; the prompt for an item points to it only when there is one.
+  const ui = await $.ui.mount(PICKER)
+  expect(((await ui.find({ type: 'Select', key: 'item' }))?.props.options as { label: string }[]).map(o => o.label)).toEqual(['All, one at a time', '1. Approve merging PR 214', '2. Pick the storage option'])
+  await ui.select({ key: 'item', value: '1' })
+  await ui.unmount()
+  const again = await $.ui.mount(PICKER)
+  await again.select({ key: 'item', value: '2' })
+  await again.unmount()
+  expect(submitted[0]).not.toContain('`list`')
+  expect(submitted[1]).toContain('Its context is in the `list` tool of pending-items.')
 })
 
 test('the model is told when to add and resolve items', async ($, on) => {

@@ -6,7 +6,9 @@ import type { Item, Pending, Stored } from '../types'
 const PLUGIN = 'pending-items'
 const ADD = `mcp__${PLUGIN}__add`
 const RESOLVE = `mcp__${PLUGIN}__resolve`
+const LIST = `mcp__${PLUGIN}__list`
 const EMPTY: Pending = { items: [], nextId: 1 }
+const PICKER = 'pending'
 // Items outlive the process in $.store, one key per session, so `claude --resume` brings them back.
 const KEY_PREFIX = 'session:'
 // Claude Code's default transcript retention: past it the session can't be resumed anyway.
@@ -18,10 +20,26 @@ const pending = atom({ plugin: 'pending-items', key: 'pending' } as const, EMPTY
 // Read by the model with every prompt: when to call the tools, and when not to.
 const INSTRUCTIONS = `# Pending items
 
-The person follows long sessions and can miss something you need from them. When you ask them for a decision or an approval that work waits on, or that is hard to reverse (merge or publish this? delete that? which of these options? may I proceed with X?), call the \`add\` tool of ${PLUGIN} with a one-line description of what you need, in the same turn as the question. Ordinary clarifications you expect answered in the next message don't go there. Once the person has answered, or the item no longer applies, call \`resolve\` with its id in the same turn. The items are shown to the person above the prompt until resolved; they can also list them with /pending.`
+The person follows long sessions and can miss something you need from them. When you ask them for a decision or an approval that work waits on, or that is hard to reverse (merge or publish this? delete that? which of these options? may I proceed with X?), call the \`add\` tool of ${PLUGIN} with a one-line description of what you need, in the same turn as the question; when the decision depends on details you could lose by the time it is answered (the options, what each implies, the PR or file at stake), put them in its \`context\`. Ordinary clarifications you expect answered in the next message don't go there. Once the person has answered, or the item no longer applies, call \`resolve\` with its id in the same turn. The items are shown to the person above the prompt until resolved; they can also list them with /pending. The \`list\` tool returns them with their context.`
 
 function list(items: Item[]) {
   return items.length === 0 ? 'Nothing pending.' : items.map(i => `${i.id}. ${i.text}`).join('\n')
+}
+
+function age(ms: number) {
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  return minutes < 24 * 60 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / (24 * 60))}d`
+}
+
+function describe(items: Item[], now: number) {
+  if (items.length === 0) return 'Nothing pending.'
+  return items
+    .map(i => {
+      const head = `${i.id}. ${i.text} (added ${age(now - Date.parse(i.addedAt))} ago)`
+      return i.context ? `${head}\n${i.context.replace(/^/gm, '   ')}` : head
+    })
+    .join('\n')
 }
 
 function isStored(value: unknown): value is Stored {
@@ -81,8 +99,20 @@ async function collectGarbage($: $) {
   for (const { key } of sessions.slice(MAX_SESSIONS)) await $.store.delete(key)
 }
 
-function workPrompt(items: Item[]) {
-  return `Let's work through what you're waiting on from me, one item at a time, in this order:\n${list(items)}\n\nFor each: say in a few lines what you need from me and the context I need to decide, then wait for my answer. Act on it, resolve the item, and only then move to the next one.`
+const WORK_ALL_PROMPT = `Let's work through what you're waiting on from me (the \`list\` tool of ${PLUGIN}), one item at a time, oldest first. For each: say in a few lines what you need from me and the context I need to decide, then wait for my answer. Act on it, resolve the item, and only then move to the next one.`
+
+function workOnePrompt(item: Item) {
+  const context = item.context ? ` Its context is in the \`list\` tool of ${PLUGIN}.` : ''
+  return `Let's work on pending item ${item.id}: ${item.text}\n\nSay in a few lines what you need from me and the context I need to decide, then wait for my answer. Act on it and resolve the item.${context}`
+}
+
+const ALL = 'all'
+
+// Not awaited: the prompt starts a turn of its own once the session is idle.
+function work($: $, items: Item[], choice: string) {
+  const item = items.find(i => String(i.id) === choice)
+  const text = choice === ALL ? WORK_ALL_PROMPT : item && workOnePrompt(item)
+  if (text) void $.prompt.submit({ text })
 }
 
 export const register: Register = on => {
@@ -91,7 +121,14 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'add',
       description: 'Records something you are waiting on from the person (a decision, an approval) so it stays visible to them until resolved. Returns its id.',
-      inputSchema: { type: 'object', properties: { text: { type: 'string', description: 'One line: what you need from the person, and for what.' } }, required: ['text'] },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'One line: what you need from the person, and for what.' },
+          context: { type: 'string', description: 'Optional, a few lines: what you need to take the item up again once the conversation no longer holds it (the options and what each implies, the PR, file or decision at stake).' },
+        },
+        required: ['text'],
+      },
       isDeferred: false,
     })
     await $.tool.register({
@@ -100,8 +137,14 @@ export const register: Register = on => {
       inputSchema: { type: 'object', properties: { id: { type: 'number', description: 'The id `add` returned.' } }, required: ['id'] },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'list',
+      description: 'Lists what you are waiting on from the person, oldest first: each item\'s id, text, age and context.',
+      inputSchema: { type: 'object', properties: {} },
+      isDeferred: false,
+    })
     if (e.isInteractive) {
-      await $.command.register({ name: 'pending', description: 'What the model is waiting on from you; `/pending work` drafts a prompt to go through the items with it one by one, `/pending done <id>` drops one, `/pending clear` all.', argumentHint: '[work | done <id> | clear]' })
+      await $.command.register({ name: 'pending', description: 'Pick a pending item to work on with the model, or all one at a time; `/pending work` starts on all directly, `/pending done <id>` drops one, `/pending clear` all.', argumentHint: '[work | done <id> | clear]' })
     }
     await sync($)
     await collectGarbage($)
@@ -136,11 +179,13 @@ export const register: Register = on => {
   on('tool.call', { tool: ADD }, async ($, e) => {
     const text = typeof e.text === 'string' ? e.text.trim() : ''
     if (!text) return { deny: 'add needs a non-empty `text`' }
+    const context = typeof e.context === 'string' ? e.context.trim() : ''
     const addedAt = new Date(await $.clock.now()).toISOString()
     let id = 0
     await mutate($, current => {
       id = current.nextId
-      return { ...current, items: [...current.items, { id, text, addedAt }], nextId: id + 1 }
+      const item: Item = context ? { id, text, addedAt, context } : { id, text, addedAt }
+      return { ...current, items: [...current.items, item], nextId: id + 1 }
     })
     return { result: `pending item ${id} added: ${text}` }
   })
@@ -153,15 +198,19 @@ export const register: Register = on => {
     return { result: `pending item ${id} resolved` }
   })
 
+  on('tool.call', { tool: LIST }, async $ => {
+    const current = await sync($)
+    return { result: describe(current.items, await $.clock.now()) }
+  })
+
   on('command.run', { command: 'pending' }, async ($, e) => {
     const [verb, arg] = (e.args ?? '').trim().split(/\s+/)
     const current = await sync($)
     if (verb === 'work') {
       if (current.items.length === 0) return { text: 'Nothing pending.' }
-      // Into the input box rather than submitted: a command can't start a turn while it holds one, and this
-      // way the person can edit the prompt before sending it.
-      await $.prompt.fill({ text: workPrompt(current.items) })
-      return { text: `The prompt to go through ${current.items.length} pending item${current.items.length === 1 ? '' : 's'} is in the input box; press Enter to start.` }
+      // The engine refuses a submit from a command.run hook, which holds the turn the prompt would wait on.
+      void $.clock.sleep(0).then(() => work($, current.items, ALL))
+      return {}
     }
     if (verb === 'clear') {
       await mutate($, p => ({ ...p, items: [] }))
@@ -173,7 +222,36 @@ export const register: Register = on => {
       await mutate($, p => ({ ...p, items: p.items.filter(i => i.id !== id) }))
       return { text: `Resolved ${id}.` }
     }
+    if (current.items.length === 0) return { text: 'Nothing pending.' }
+    const opened = await $.ui.open({ id: PICKER, title: 'Pending items', focus: true, closeOnEscape: true, holdToasts: true, rows: 4 })
+    if (opened.isPlaced) return {}
+    // An unplaced pane stays open to show up later; a picker that pops up unasked would be stale by then.
+    await $.ui.close({ id: PICKER })
     return { text: list(current.items) }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PICKER }, async ($, e) => {
+    const elements = $.ui.resolve(e)
+    const { Box, Button, Text } = elements
+    // The mobile app's table has a Select it draws as an empty box.
+    const Select = e.surface !== 'mobile' && 'Select' in elements ? elements.Select : undefined
+    const { items } = (await read($, pending)) ?? EMPTY
+    if (items.length === 0) return <Text dimColor>Nothing pending.</Text>
+    const options = [{ value: ALL, label: 'All, one at a time' }, ...items.map(i => ({ value: String(i.id), label: `${i.id}. ${i.text}` }))]
+    const pick = async (choice: string) => {
+      await $.ui.close({ id: PICKER })
+      work($, items, choice)
+    }
+    return (
+      <Box flexDirection="column">
+        <Text bold>Select which pending item you want to chat about</Text>
+        {Select ? (
+          <Select key="item" options={options} autoFocus onSelect={(value: string) => void pick(value)} />
+        ) : (
+          options.map((o, n) => <Button key={o.value} label={o.label} plain autoFocus={n === 0 || undefined} onPress={() => void pick(o.value)} />)
+        )}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -187,7 +265,7 @@ export const register: Register = on => {
         <Text wrap="truncate-end">
           <Text color="yellow">
             {'⚑ '}
-            {current.items.length === 1 ? 'Waiting on you' : `${current.items.length} waiting on you`}: {first.text}
+            {current.items.length === 1 ? 'Waiting on you' : `${current.items.length} items waiting on you`}: {first.text}
           </Text>
           {rest.length > 0 && <Text dimColor> +{rest.length} more</Text>}
           <Text dimColor> · /pending</Text>
