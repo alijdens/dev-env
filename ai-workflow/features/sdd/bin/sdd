@@ -1375,6 +1375,12 @@ def cmd_ready(args):
     tasks, questions = proj.tasks(), proj.questions()
     g = Graph.from_tasks(tasks)
     ready = [s for s, t in tasks.items() if t.state in STARTABLE and not not_ready(g, s, tasks, questions)]
+    cycle = g.find_cycle()
+    if cycle and args.target is not None:
+        raise Error("dependency cycle: " + " -> ".join(cycle))
+    if cycle:
+        # Unrelated work can still go ahead, but nothing would otherwise say why these never show up.
+        print(f"dependency cycle: {' -> '.join(cycle)} (these tasks can never start; fix with `sdd dep rm`)", file=sys.stderr)
     if args.target is not None:
         ready, behind, chain = toward(proj, g, tasks, questions, ready, args.target)
         order = lambda s: (-chain[s], -behind[s], s)
