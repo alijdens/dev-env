@@ -10,7 +10,7 @@ The orchestrator takes ready tasks through claim, implementation, review and fix
   - `low`, `medium`, `high`: merge PRs rated up to that level.
   - `all`: merge anything, critical included.
 - **Approve** (default `yes`): `approve=no` skips step 5; the PRs are marked ready for review but not approved.
-- **Tasks** (optional): limit the run to these slugs (and only start them once they're ready). Otherwise, the run's task set is every task on main when the run starts, plus the tasks this run's own merges make ready. Tasks that others add to main during the run are not started: a planning session running in parallel would otherwise keep the run going indefinitely. They go in the report for the next run.
+- **Tasks** (optional): limit the run to these slugs (and only start them once they're ready). Otherwise, the run's task set is every task on main when the run starts, plus the tasks this run's own merges make ready, including the rest of a task a worker split (`working.md`). Tasks that others add to main during the run are not started: a planning session running in parallel would otherwise keep the run going indefinitely. They go in the report for the next run.
 - **Budget** (optional): a number of tasks or a duration. Once reached, no new task starts and in-flight ones finish.
 
 When the user changes the inputs mid-run, restate the new reading in one line and wait for the answer before acting on it: a misread merge policy or a skipped step is cheap to confirm and expensive to undo. "Stop" means: pick no new task, let in-flight PRs finish their current round, then report. "Stop now" means: also stop the running agents, leave their branches pushed, and report where each task stands.
@@ -21,7 +21,7 @@ Invoking the orchestrator authorizes merging every claim PR, whatever the policy
 
 `sdd root` must succeed. Keep the user's working copy untouched: give the orchestrator its own worktree at `origin/main` (e.g. `../<repo>-worktrees/orchestrator`) and refresh it with `git fetch` and a reset to `origin/main` before every pick, so `sdd ready` sees what main sees. Record the commit main was at when the run started: the report reads the questions raised since then from it.
 
-On every refresh, before resetting, diff the in-flight tasks' files between the old and new `origin/main` (`git diff <old> <new> -- <data root>/tasks/in-progress/`). A planning session may have merged a change to a task that a worker is implementing: forward the new definition to that worker with the same prompt rules as a scope change, and schedule a re-review of its PR. A task that was removed or moved out of `in-progress` by someone else is dropped from the run and reported. Also check whether a held task's question (below) has been answered: if so, it gets a fix round with the answer.
+On every refresh, before resetting, diff the in-flight tasks' files and the specs they link between the old and new `origin/main` (`git diff <old> <new> -- <data root>/tasks/in-progress/ <data root>/specs/`). A planning session may have merged a change to a task, or to the feature spec, that a worker is implementing: forward the new definition to that worker with the same prompt rules as a scope change, and schedule a re-review of its PR. A task that was removed or moved out of `in-progress` by someone else is dropped from the run and reported. Also check whether a held task's question (below) has been answered: if so, it gets a fix round with the answer.
 
 ## Loop
 
@@ -41,8 +41,8 @@ Merging a PR can make others conflict with main: the worker rebases onto `origin
 The orchestrator applies the plan; it doesn't change it. Three things are the user's, whatever the merge policy says:
 
 - **A finding that changes an accepted decision**, breaks a principle, or shows a criterion the code can't meet. It isn't resolved by picking a side, by "keep the behaviour and add a proposed ADR", or by rewording the criterion.
-- **A decision a worker added.** An implementation PR that adds a `proposed` ADR carries a decision the user hasn't seen: it may merge under the policy, but the report lists every such ADR under "decisions awaiting acceptance". One that amends or supersedes an accepted ADR is a hold (below).
-- **Facts not in the plan.** Context added to a worker's prompt is quoted from the task, its ADRs, specs or questions, with the source named. What the orchestrator can't source that way isn't sent as context; if the worker needs it, it's a question.
+- **A decision a worker added.** An implementation PR that adds a `proposed` ADR or business rule carries a decision the user hasn't seen: it may merge under the policy, but the report lists every such record under "decisions awaiting acceptance". One that amends or supersedes an accepted record is a hold (below).
+- **Facts not in the plan.** Context added to a worker's prompt is quoted from the task, its ADRs, business rules, specs or questions, with the source named. What the orchestrator can't source that way isn't sent as context; if the worker needs it, it's a question.
 
 ### Held PRs
 
@@ -73,4 +73,4 @@ Sub-agents can stall or loop, so every one of them runs under a bound, and reach
 
 ## Report
 
-At the end, one row per task: PR link, risk, final state (merged, held and on which question, ready for the user, blocked and why, dropped and why), rejected findings with their reason, and steps that failed (e.g. approval refused). Then: PRs whose description still has a screenshot placeholder; proposed ADRs the merged PRs added (decisions awaiting acceptance); tasks skipped for their `needs`; tasks that appeared on main during the run; the tasks still waiting on unmerged PRs. Finally the open questions: first `sdd blockers`, the ones that alone keep a task from starting or hold a built PR, with the work waiting behind each; then the rest from `sdd questions --since <start commit>`, the questions raised during the run, each with the tasks it blocks, so the user can answer them before the next run.
+At the end, one row per task: PR link, risk, final state (merged, held and on which question, ready for the user, blocked and why, dropped and why), rejected findings with their reason, and steps that failed (e.g. approval refused, a screenshot left as a placeholder, with the reason the worker gave). Then: proposed ADRs and business rules the merged PRs added (decisions awaiting acceptance); tasks skipped for their `needs`; tasks that appeared on main during the run; the tasks still waiting on unmerged PRs. Finally the open questions: first `sdd blockers`, the ones that alone keep a task from starting or hold a built PR, with the work waiting behind each; then the rest from `sdd questions --since <start commit>`, the questions raised during the run, each with the tasks it blocks, so the user can answer them before the next run.

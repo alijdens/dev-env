@@ -3,7 +3,7 @@
 Two short docs at the data root give every planning and review session the context a task alone doesn't carry:
 
 - `goal.md`: why the project exists, for whom, what success looks like, what it won't do. Planning checks every feature and ADR against it.
-- `principles.md`: the rules every change must respect (stack boundaries, compatibility, security, quality, definition of done). Reviews check changes against it; ADRs decide within it.
+- `principles.md`: what every change must respect (stack boundaries, compatibility, security, quality, definition of done). Reviews check changes against it; ADRs and business rules decide within it.
 
 `sdd doc new <name>` writes the template, whose comments brief each section; `sdd doc list` shows which docs are missing, draft or ok; `sdd doc check` fails while any is a draft (guidance comments left, empty sections, over the length limit). `sdd validate` warns about missing docs and fails on drafts, so a half-written doc doesn't merge.
 
@@ -26,6 +26,7 @@ The agent writes the doc; the user supplies the facts. Section by section, in th
 Keep the user inside the doc's scope. When an answer drifts, say where it belongs and carry on:
 
 - Implementation detail or architecture ("we use Postgres with a queue in front"): an ADR, or at most a line under principles' stack section if it's a commitment.
+- A product rule of one domain ("a user posts at most 3 pictures a day"): a business rule (`sdd rule`), not a principle.
 - A decision made during the conversation ("let's go with per-key limits"): an ADR, once there's a feature to attach it to.
 - A feature or piece of work ("we need an admin page"): a task or a spec, not a goal.
 - A preference without a consequence ("we like clean code"): drop it; a principle a reviewer can't check is noise.

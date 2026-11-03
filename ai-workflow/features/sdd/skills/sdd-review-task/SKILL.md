@@ -1,7 +1,7 @@
 ---
 name: sdd-review-task
 description: >-
-  Reviews a PR or branch implementing a task from the project's task workflow backlog, against its task, ADRs and testing standards.
+  Reviews a PR or branch implementing a task from the project's task workflow backlog, against its task, ADRs, business rules and testing standards.
   Use when asked to review a task's PR or implementation in a project that uses the task workflow.
 ---
 

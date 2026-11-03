@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import textwrap
+from collections import namedtuple
 from pathlib import Path
 
 import pytest
@@ -164,21 +165,34 @@ def test_brief_prints_the_task_and_everything_linked_to_it(repo):
     assert out.startswith("slug: a\nstate: todo\n")
     assert f"=== architecture decision: arch/{adr.stem}.md" in out and "Keep it in Redis." in out
     assert "=== question (open): questions/open/ttl.md" in out and "=== task: tasks/todo/a.md" in out
-    assert "tasks/todo/b.md" not in out and "=== goal" not in out and "=== review checks" not in out
+    assert "tasks/todo/b.md" not in out and "=== goal" not in out
+    assert out.rstrip().endswith("=== review checks (sdd checks --task)\n\n" + f"{adr.stem}\t\tStore\n  - Every key has a TTL.")
 
     review = run("brief", "a", "--review", cwd=repo).stdout
     assert "=== dependent task: tasks/todo/b.md" in review and "=== goal: goal.md" in review
-    assert review.rstrip().endswith("=== review checks (sdd checks --task)\n\n" + f"{adr.stem}\t\tStore\n  - Every key has a TTL.")
+    assert review.rstrip().endswith("  - Every key has a TTL.")
     assert "unknown task" in fails("brief", "zzz", cwd=repo)
 
 
-def test_accept_marks_proposed_decisions_accepted(repo):
-    run("adr", "store", "--title", "Store", cwd=repo)
-    adr = next((repo / "docs/arch").glob("*-store.md"))
-    assert run("accept", adr.stem, cwd=repo).stdout == f"accepted {adr.stem}\n"
-    assert "status: accepted" in adr.read_text()
-    assert "not proposed" in fails("accept", adr.stem, cwd=repo)
-    assert "unknown architecture decision" in fails("accept", "nope", cwd=repo)
+# Architecture decisions and business rules share one engine: the record tests run for both kinds.
+Kind = namedtuple("Kind", "cmd dir label listing frozen")
+KINDS = [Kind("adr", "arch", "architecture decision", ["adrs"], "Decision"),
+         Kind("rule", "rules", "business rule", ["rules", "--all"], "Rule")]
+each_kind = pytest.mark.parametrize("kind", KINDS, ids=[k.cmd for k in KINDS])
+
+
+def record(repo, kind, slug, *args):
+    return Path(run(kind.cmd, slug, *args, cwd=repo).stdout.strip()).stem
+
+
+@each_kind
+def test_accept_marks_proposed_records_accepted(repo, kind):
+    name = record(repo, kind, "store", "--title", "Store")
+    path = repo / f"docs/{kind.dir}/{name}.md"
+    assert run("accept", name, cwd=repo).stdout == f"accepted {name}\n"
+    assert "status: accepted" in path.read_text()
+    assert "not proposed" in fails("accept", name, cwd=repo)
+    assert "unknown architecture decision or business rule" in fails("accept", "nope", cwd=repo)
 
 
 def test_dep_edits_frontmatter_and_rejects_cycles(repo):
@@ -207,7 +221,7 @@ def test_rm_only_deletes_unreferenced_planned_tasks(repo):
 def test_validate_reports_inconsistencies(repo):
     run("new", "a", "--title", "A", cwd=repo)
     run("new", "b", "--title", "B", "--after", "a", cwd=repo)
-    assert run("validate", cwd=repo).stdout.endswith("ok: 2 tasks, 1 dependencies, 0 architecture decisions, 0 open questions, 0 open ideas\n")
+    assert run("validate", cwd=repo).stdout.endswith("ok: 2 tasks, 1 dependencies, 0 architecture decisions, 0 business rules, 0 open questions, 0 open ideas\n")
 
     (repo / "docs/tasks/todo/b.md").write_text("---\ntitle: B\nafter: [a, ghost]\narch: [missing-adr]\n---\n")
     (repo / "docs/tasks/todo/.gitkeep").unlink()
@@ -256,7 +270,7 @@ def test_open_blocking_question_holds_a_task_like_a_prerequisite(repo):
     adr = next((repo / "docs/arch").glob("*-limits.md")).stem
     path = Path(run("ask", "per-key", "--title", "Per key?", "--task", "a", "--blocks", "b", "--arch", adr, cwd=repo).stdout.strip())
     assert path == repo / "docs/questions/open/per-key.md"
-    assert f"tasks: [a]\narch: [{adr}]\nblocks: [b]\nasked: " in path.read_text()
+    assert f"tasks: [a]\narch: [{adr}]\nrules: []\nblocks: [b]\nasked: " in path.read_text()
 
     assert run("ready", cwd=repo).stdout == "a\ttodo\tA\t0\t\n"
     assert "ready: no, waiting on question per-key" in run("show", "b", cwd=repo).stdout
@@ -310,7 +324,7 @@ def test_validate_requires_questions_to_stand_alone(repo):
     assert "unknown task ghost in tasks" in out and "unknown architecture decision nope" in out
 
     path.write_text("---\ntitle: Q\ntasks: []\narch: []\nblocks: []\n---\n\n## Question\n\nQ\n\n## Context\n\nC\n\n## Answer\n")
-    assert "links to no task or architecture decision" in run("validate", cwd=repo).stdout
+    assert "links to no task, architecture decision or business rule" in run("validate", cwd=repo).stdout
 
 
 def test_a_claimed_task_may_be_held_by_a_question_but_not_a_done_one(repo, tmp_path):
@@ -332,23 +346,31 @@ def adr(repo, slug, *args):
     return next((repo / "docs/arch").glob(f"*-{slug}.md")).stem if not args else Path(run("adr", slug, *args, cwd=repo).stdout.strip()).stem
 
 
-def test_adr_frontmatter_amend_and_supersede(repo):
-    old = adr(repo, "limits", "--title", "Limits in memory", "--areas", "backend/rate-limiting")
-    text = (repo / f"docs/arch/{old}.md").read_text()
+@each_kind
+def test_records_amend_and_supersede(repo, kind):
+    old = record(repo, kind, "limits", "--title", "Limits in memory", "--areas", "backend/rate-limiting")
+    path = repo / f"docs/{kind.dir}/{old}.md"
+    text = path.read_text()
     assert text.startswith(f"---\ntitle: Limits in memory\nstatus: proposed\ndate: ") and "areas: [backend/rate-limiting]" in text
+    assert f"\n## {kind.frozen}\n" in text
 
-    amend = adr(repo, "limits-keys", "--title", "Limits keyed per API key", "--areas", "backend/rate-limiting", "--amends", old)
-    text = (repo / f"docs/arch/{old}.md").read_text()
-    assert f"amended-by: [{amend}]" in text and "status: proposed" in text
-    new = adr(repo, "limits-redis", "--title", "Limits in Redis", "--supersedes", old)
-    text = (repo / f"docs/arch/{old}.md").read_text()
-    assert f"superseded-by: [{new}]" in text and "status: superseded" in text
-    assert "unknown architecture decision" in fails("adr", "x", "--title", "x", "--amends", "nope", cwd=repo)
+    amend = record(repo, kind, "limits-keys", "--title", "Limits keyed per API key", "--areas", "backend/rate-limiting", "--amends", old)
+    assert f"amended-by: [{amend}]" in path.read_text() and "status: proposed" in path.read_text()
+    new = record(repo, kind, "limits-redis", "--title", "Limits in Redis", "--supersedes", old)
+    assert f"superseded-by: [{new}]" in path.read_text() and "status: superseded" in path.read_text()
+    assert f"unknown {kind.label}" in fails(kind.cmd, "x", "--title", "x", "--amends", "nope", cwd=repo)
+    assert "already exists" in fails("rule" if kind.cmd == "adr" else "adr", "limits", "--title", "x", cwd=repo)
 
-    out = run("adrs", cwd=repo).stdout
+    out = run(*kind.listing, cwd=repo).stdout
     assert f"{old}\tsuperseded\t0\tbackend/rate-limiting\tLimits in memory" in out
-    assert run("adrs", "--area", "backend", cwd=repo).stdout.count("\n") == 2
+    assert run(*kind.listing, "--area", "backend", cwd=repo).stdout.count("\n") == 2
     assert run("areas", cwd=repo).stdout == "2\tbackend/rate-limiting\n"
+
+
+def test_rules_lists_the_rules_in_force(repo):
+    old = record(repo, KINDS[1], "cap", "--title", "At most 3 pictures a day")
+    new = record(repo, KINDS[1], "cap-five", "--title", "At most 5 pictures a day", "--supersedes", old)
+    assert [line.split("\t")[0] for line in run("rules", cwd=repo).stdout.splitlines()] == [new]
 
 
 def test_context_ranks_foundations_and_matches_areas_or_words(repo):
@@ -376,6 +398,39 @@ def test_context_ranks_foundations_and_matches_areas_or_words(repo):
     assert "  schema\ttodo\tSchema" in out
     assert "showing only the foundations" in run("context", cwd=repo).stdout
     assert "specs:\n  " + str(repo / "docs/specs/data-model.md") in run("show", "schema", cwd=repo).stdout
+
+
+def test_context_finds_the_adrs_cited_in_the_code_a_feature_touches(repo, tmp_path):
+    cited = adr(repo, "ttl", "--title", "Keys expire", "--areas", "backend")
+    other = adr(repo, "unrelated", "--title", "Unrelated", "--areas", "backend")
+    src = repo / "src/store"
+    src.mkdir(parents=True)
+    (src / "cache.py").write_text(f"TTL = 60  # every key expires (adr: {cited})\n# stale (adr: 2020-01-01-gone)\n")
+    (repo / ".gitignore").write_text("build/\n")
+    (repo / "src/build").mkdir()
+    (repo / "src/build/x.py").write_text(f"# adr: {other}\n")
+
+    for path in ("src", "src/store/cache.py"):
+        out = run("context", "--path", path, cwd=repo).stdout
+        matching = out.split("matching ADRs:")[1].split("matching business rules:")[0]
+        assert f"  {cited}\tproposed\t0 refs\tKeys expire (cited in the code)" in matching
+        assert other not in matching
+        assert "cited in the code but unknown (renamed or never written?): adr: 2020-01-01-gone" in out
+    assert "no such file or directory" in fails("context", "--path", "nope", cwd=repo)
+
+    outside = tmp_path / "outside"  # not a git repo: the files are walked, binaries skipped
+    (outside / ".hidden").mkdir(parents=True)
+    (outside / "a.py").write_text(f"# adr: {cited}\n")
+    (outside / "b.bin").write_bytes(f"\0adr: {other}\n".encode())
+    (outside / ".hidden/c.py").write_text(f"# adr: {other}\n")
+    matching = run("context", "--path", outside, cwd=repo).stdout.split("matching ADRs:")[1].split("matching business rules:")[0]
+    assert cited in matching and other not in matching
+
+
+def test_feature_spec_has_the_planning_sections(repo):
+    path = Path(run("spec", "export", "--title", "Export", "--areas", "cli", "--feature", cwd=repo).stdout.strip())
+    assert path.read_text().endswith("# Export\n\n## Goal\n\n## How it works\n\n## Shape\n")
+    assert "## Goal" not in Path(run("spec", "plain", "--title", "Plain", cwd=repo).stdout.strip()).read_text()
 
 
 def test_link_adds_references_to_done_tasks(repo, tmp_path):
@@ -410,7 +465,7 @@ def test_link_edits_questions_and_adrs_too(repo):
     fill_question(q)
 
     run("link", "q", "--task", "b", "--blocks", "b", "--arch", old, cwd=repo)
-    assert f"tasks: [a, b]\narch: [{old}]\nblocks: [b]" in q.read_text()
+    assert f"tasks: [a, b]\narch: [{old}]\nrules: []\nblocks: [b]" in q.read_text()
     assert "ready: no, waiting on question q" in run("show", "b", cwd=repo).stdout
 
     run("link", new, "--amends", old, cwd=repo)
@@ -422,7 +477,7 @@ def test_link_edits_questions_and_adrs_too(repo):
     assert "doesn't apply to a question" in fails("link", "q", "--spec", "s", cwd=repo)
     assert "doesn't apply to a task" in fails("link", "a", "--blocks", "b", cwd=repo)
     assert "can't amend itself" in fails("link", new, "--amends", new, cwd=repo)
-    assert "unknown task, question, idea or architecture decision" in fails("link", "zzz", "--arch", old, cwd=repo)
+    assert "unknown task, question, idea, spec, architecture decision or business rule" in fails("link", "zzz", "--arch", old, cwd=repo)
     assert "nothing to link" in fails("link", "a", cwd=repo)
     run("new", "q", "--title", "Task named like the question", cwd=repo)
     assert "pass --as task|question" in fails("link", "q", "--arch", new, cwd=repo)
@@ -474,7 +529,7 @@ def test_ideas_are_never_startable_and_wait_on_their_prerequisites(repo, tmp_pat
     run("new", "login", "--title", "Login", cwd=repo)
     path = Path(run("idea", "sso", "--title", "SSO", "--areas", "backend/auth", "--after", "login", "--task", "login", cwd=repo).stdout.strip())
     assert path == tmp_path / "data/ideas/open/sso.md"
-    assert "areas: [backend/auth]\nafter: [login]\ntasks: [login]\narch: []\nraised: " in path.read_text()
+    assert "areas: [backend/auth]\nafter: [login]\ntasks: [login]\narch: []\nrules: []\nraised: " in path.read_text()
     fill_idea(path)
     assert "already exists" in fails("idea", "sso", "--title", "x", cwd=repo)
     assert "unknown task" in fails("idea", "other", "--title", "x", "--after", "zzz", cwd=repo)
@@ -500,7 +555,7 @@ def test_close_idea_needs_an_outcome_and_records_what_it_became(repo):
     path = Path(run("idea", "sso", "--title", "SSO", "--areas", "backend", cwd=repo).stdout.strip())
     fill_idea(path)
     assert "under `## Outcome` first" in fails("close-idea", "sso", cwd=repo)
-    assert "unknown task, architecture decision or spec" in fails("close-idea", "sso", "--into", "zzz", cwd=repo)
+    assert "unknown task, architecture decision, business rule or spec" in fails("close-idea", "sso", "--into", "zzz", cwd=repo)
 
     fill_idea(path, outcome="Planned as login.")
     run("close-idea", "sso", "--into", "login", cwd=repo)
@@ -527,7 +582,7 @@ def test_validate_requires_ideas_to_stand_alone(repo):
 
     path.write_text("---\ntitle: SSO\nareas: [x]\nafter: [ghost]\ntasks: []\narch: [nope]\ninto: [gone]\n---\n\n## Idea\n\nI\n\n## Context\n\nC\n")
     out = run("validate", cwd=repo, check=False).stdout
-    for msg in ("unknown task ghost in after", "unknown architecture decision nope", "unknown task, architecture decision or spec gone in into"):
+    for msg in ("unknown task ghost in after", "unknown architecture decision nope", "unknown task, architecture decision, business rule or spec gone in into"):
         assert msg in out, msg
 
     (repo / "docs/ideas/closed").mkdir(exist_ok=True)
@@ -601,10 +656,13 @@ def test_checks_collects_review_checks_by_area_or_task(repo):
     assert "over 10 review checks" in run("validate", cwd=repo).stdout
 
 
-def test_validate_refuses_edits_to_accepted_adr_bodies(shared):
-    a = adr(shared, "fixed", "--title", "Fixed", "--areas", "x")
-    path = shared / f"docs/arch/{a}.md"
-    path.write_text(path.read_text().replace("status: accepted", "status: accepted").replace("status: proposed", "status: accepted").replace("## Alternatives considered\n", "## Alternatives considered\n\nnone really\n"))
+@each_kind
+def test_validate_refuses_edits_to_accepted_record_bodies(shared, kind):
+    a = record(shared, kind, "fixed", "--title", "Fixed", "--areas", "x")
+    path = shared / f"docs/{kind.dir}/{a}.md"
+    path.write_text(path.read_text().replace("status: proposed", "status: accepted")
+                    .replace("## Alternatives considered\n", "## Alternatives considered\n\nnone really\n")
+                    .replace("## Rule\n", "## Rule\n\nA user posts at most 3 pictures a day.\n"))
     commit_all(shared, "accept")
     git("push", "-q", cwd=shared)
     assert "body changed" not in run("validate", cwd=shared).stdout
@@ -614,8 +672,108 @@ def test_validate_refuses_edits_to_accepted_adr_bodies(shared):
     path.write_text(path.read_text() + "\n## Review checks\n\n- The variable is read once at startup.\n")
     assert "body changed" not in run("validate", cwd=shared).stdout
 
-    path.write_text(path.read_text().replace("## Decision\n", "## Decision\n\nchanged my mind\n"))
+    path.write_text(path.read_text().replace(f"## {kind.frozen}\n", f"## {kind.frozen}\n\nchanged my mind\n"))
     assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+
+
+# --- business rules ------------------------------------------------------------------------
+
+
+def fill_rule(repo, name, text="A user posts at most 3 pictures a day."):
+    path = repo / f"docs/rules/{name}.md"
+    path.write_text(path.read_text().replace("## Rule\n", f"## Rule\n\n{text}\n"))
+    return path
+
+
+def test_rules_link_like_adrs_and_reach_workers(repo):
+    cap = record(repo, KINDS[1], "cap", "--title", "At most 3 pictures a day", "--areas", "posting")
+    path = fill_rule(repo, cap)
+    path.write_text(path.read_text() + "\n## Review checks\n\n- Every path that creates a post goes through the cap.\n")
+    run("new", "upload", "--title", "Upload", "--rule", cap, cwd=repo)
+    assert f"rules: [{cap}]" in (repo / "docs/tasks/todo/upload.md").read_text()
+    assert "unknown business rule" in fails("new", "x", "--title", "X", "--rule", "nope", cwd=repo)
+    assert "unknown business rule" in fails("new", "x", "--title", "X", "--rule", adr(repo, "a", "--title", "A"), cwd=repo)
+
+    out = run("brief", "upload", cwd=repo).stdout
+    assert f"rules:\n  {path}" in out and f"=== business rule: rules/{cap}.md" in out
+    assert out.rstrip().endswith(f"{cap}\tposting\tAt most 3 pictures a day\n  - Every path that creates a post goes through the cap.")
+
+    run("new", "scheduler", "--title", "Scheduler", cwd=repo)
+    run("ask", "q", "--title", "Q", "--task", "scheduler", cwd=repo)
+    fill_idea(Path(run("idea", "auto", "--title", "Auto-post", "--areas", "scheduler", cwd=repo).stdout.strip()))
+    run("spec", "auto", "--title", "Auto-post", "--areas", "scheduler", "--feature", cwd=repo)
+    for slug, as_ in (("scheduler", "task"), ("q", "question"), ("auto", "idea"), ("auto", "spec")):
+        run("link", slug, "--as", as_, "--rule", cap, cwd=repo)
+    for f in ("tasks/todo/scheduler.md", "questions/open/q.md", "ideas/open/auto.md", "specs/auto.md"):
+        assert f"rules: [{cap}]" in (repo / "docs" / f).read_text(), f
+    assert "doesn't apply to a rule" in fails("link", cap, "--rule", cap, cwd=repo)
+    assert "q\topen\tQ" in run("questions", "--rule", cap, cwd=repo).stdout
+    assert run("checks", "--task", "scheduler", cwd=repo).stdout.startswith(f"{cap}\tposting\t")
+
+
+def test_context_lists_business_rules_from_any_area(repo):
+    cap = record(repo, KINDS[1], "cap", "--title", "At most 3 pictures a day", "--areas", "posting")
+    fill_rule(repo, cap)
+    other = record(repo, KINDS[1], "names", "--title", "Display names are unique", "--areas", "accounts")
+    run("new", "upload", "--title", "Upload", "--rule", cap, cwd=repo)
+    (repo / "src").mkdir()
+    (repo / "src/posts.py").write_text(f"def create(): ...  # at most 3 a day (rule: {cap})\n")
+
+    out = run("context", "--area", "scheduler", cwd=repo).stdout
+    assert f"other business rules (a feature in any area may have to respect them):\n  {cap}\t" in out
+    assert f"  {other}\t" in out.split("other business rules")[1]
+
+    out = run("context", "--path", "src", cwd=repo).stdout
+    matching = out.split("matching business rules:")[1].split("other business rules")[0]
+    assert f"  {cap}\tproposed\t1 refs\tAt most 3 pictures a day (cited in the code)" in matching
+    assert "  upload\ttodo\tUpload" in out.split("tasks referencing")[1]
+
+    five = record(repo, KINDS[1], "cap-five", "--title", "At most 5 pictures a day", "--areas", "posting", "--supersedes", cap)
+    matching = run("context", "--path", "src", cwd=repo).stdout.split("matching business rules:")[1].split("other business rules")[0]
+    assert f"  {cap}\tsuperseded\t1 refs\tAt most 3 pictures a day (superseded-by {five}) (cited in the code)" in matching
+
+    for i in range(15):
+        record(repo, KINDS[1], f"r{i}", "--title", f"R{i}", "--areas", "billing")
+    out = run("context", "--area", "posting", cwd=repo).stdout
+    assert f"  {five}\t" in out.split("matching business rules:")[1].split("other business rules")[0]
+    assert "  16 more, by area (`sdd rules --area <area>`): accounts 1, billing 15" in out
+
+
+def test_validate_checks_rules_and_the_code_citing_records(repo):
+    cap = record(repo, KINDS[1], "cap", "--title", "Cap", "--areas", "posting")
+    assert "empty `## Rule` section" in run("validate", cwd=repo).stdout
+    path = repo / f"docs/rules/{cap}.md"
+    path.write_text(path.read_text().replace("status: proposed", "status: accepted"))
+    assert f"error: {path}: empty `## Rule` section" in run("validate", cwd=repo, check=False).stdout
+    fill_rule(repo, cap)
+    new = record(repo, KINDS[1], "cap-five", "--title", "Cap of five", "--areas", "posting", "--supersedes", cap)
+    fill_rule(repo, new, "A user posts at most 5 pictures a day.")
+
+    (repo / "src").mkdir()
+    (repo / "src/posts.py").write_text(f"# rule: {cap}\n# rule: 2020-01-01-gone\n# adr: {new}\n")
+    (repo / "docs/notes.md").write_text("# rule: 2020-01-01-in-the-data-root\n")
+    (repo / "src/cache.pyc").write_bytes(b"\0\0rule: 2020-01-01-in-a-binary\n")
+    out = run("validate", cwd=repo).stdout
+    assert f"src/posts.py:1: cites rule: {cap}, superseded by {new}" in out
+    assert "src/posts.py:2: cites rule: 2020-01-01-gone, which doesn't exist" in out
+    assert f"src/posts.py:3: cites adr: {new}, which is a business rule; cite it as `rule: {new}`" in out
+    assert "in-the-data-root" not in out and "in-a-binary" not in out
+
+    (repo / "docs/tasks/todo/t.md").write_text("---\ntitle: T\nafter: []\narch: []\nrules: [ghost]\n---\n")
+    (repo / "docs/tasks/todo/u.md").write_text(f"---\ntitle: U\nafter: []\narch: [{cap}]\nrules: []\n---\n")
+    (repo / "docs/arch").mkdir(exist_ok=True)
+    (repo / f"docs/arch/{new}.md").write_text((repo / f"docs/rules/{new}.md").read_text())
+    out = run("validate", cwd=repo, check=False).stdout
+    assert "unknown business rule ghost" in out and "names are unique across ADRs and business rules" in out
+    assert f"u.md: unknown architecture decision {cap}" in out
+
+
+def test_validate_warns_about_empty_feature_specs(repo):
+    path = Path(run("spec", "export", "--title", "Export", "--areas", "cli", "--feature", cwd=repo).stdout.strip())
+    out = run("validate", cwd=repo).stdout
+    assert "empty `## Goal` section" in out and "empty `## How it works` section" in out
+    path.write_text(path.read_text().replace("## Goal\n", "## Goal\n\nG\n").replace("## How it works\n", "## How it works\n\nH\n"))
+    assert "empty `## Goal`" not in run("validate", cwd=repo).stdout
 
 
 def test_validate_warns_when_agent_section_is_outdated(repo):
