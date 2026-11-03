@@ -239,16 +239,16 @@ function submissions(on: On) {
   return submitted
 }
 
-test('/pending work starts on the items one at a time', async ($, on) => {
+test('/pending all starts on the items one at a time', async ($, on) => {
   const clock = engine(on)
   const submitted = submissions(on)
   const run = pendingCommand($)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-  expect(await run('work')).toBe('Nothing pending.')
+  expect(await run('all')).toBe('Nothing pending.')
 
   await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Approve merging PR 214' })
   await $.tool.call({ tool: 'mcp__pending-items__add', text: 'Pick the storage option' })
-  await run('work')
+  await run('all')
   await clock.advance(0)
   expect(submitted).toHaveLength(1)
   expect(submitted[0]).toContain('(the `list` tool of pending-items), one item at a time')
