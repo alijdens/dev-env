@@ -1,3 +1,4 @@
 .rendered/
 .rendered.new/
 .rendered.old/
+__pycache__/
