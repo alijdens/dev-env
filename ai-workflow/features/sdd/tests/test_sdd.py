@@ -214,23 +214,46 @@ def test_ready_reports_a_dependency_cycle_instead_of_crashing(repo):
 def test_brief_prints_the_task_and_everything_linked_to_it(repo):
     run("adr", "store", "--title", "Store", cwd=repo)
     adr = next((repo / "docs/arch").glob("*-store.md"))
-    adr.write_text(adr.read_text().replace("## Decision\n", "## Decision\n\nKeep it in Redis.\n") + "## Review checks\n\n- Every key has a TTL.\n")
+    adr.write_text(adr.read_text().replace("## Decision\n", "## Decision\n\nKeep it in Redis.\n")
+                   .replace("## Context\n", "## Context\n\nSessions outgrew memory.\n") + "## Review checks\n\n- Every key has a TTL.\n")
     run("new", "a", "--title", "A", "--arch", adr.stem, cwd=repo)
     run("new", "b", "--title", "B", "--after", "a", cwd=repo)
     fill_question(Path(run("ask", "ttl", "--title", "How long?", "--task", "a", cwd=repo).stdout.strip()))
     fill_doc(Path(run("doc", "new", "goal", cwd=repo).stdout.strip()))
 
     out = run("brief", "a", cwd=repo).stdout
-    assert out.startswith("slug: a\nstate: todo\n")
-    assert f"=== architecture decision: arch/{adr.stem}.md" in out and "Keep it in Redis." in out
+    toc, body = out.split("\n\n=== status (sdd show)\n\n", 1)
+    adr_title = f"architecture decision: arch/{adr.stem}.md (without Context, Alternatives considered, Consequences: --full)"
+    sections = dict(s.split("\n\n", 1) for s in ("=== status (sdd show)\n\n" + body).split("\n=== ")[1:])
+    assert toc.splitlines() == ["contents (bytes):"] + [f"  {len(text.rstrip().encode()):>6}  {title}" for title, text in
+                                                       [("status (sdd show)", body.split("\n\n=== ")[0])] + list(sections.items())]
+    assert body.startswith("slug: a\nstate: todo\n")
+    assert f"=== {adr_title}\n\n" in out and "Keep it in Redis." in out and "Sessions outgrew memory." not in out
     assert "=== question (open): questions/open/ttl.md" in out and "=== task: tasks/todo/a.md" in out
     assert "tasks/todo/b.md" not in out and "=== goal" not in out
+    assert out.count("Every key has a TTL.") == 1
     assert out.rstrip().endswith("=== review checks (sdd checks --task)\n\n" + f"{adr.stem}\t\tStore\n  - Every key has a TTL.")
+    assert "Sessions outgrew memory." in run("brief", "a", "--full", cwd=repo).stdout
 
     review = run("brief", "a", "--review", cwd=repo).stdout
     assert "=== dependent task: tasks/todo/b.md" in review and "=== goal: goal.md" in review
     assert review.rstrip().endswith("  - Every key has a TTL.")
     assert "unknown task" in fails("brief", "zzz", cwd=repo)
+
+
+def test_brief_too_long_to_print_goes_to_a_file(repo):
+    run("new", "a", "--title", "A", cwd=repo)
+    task = repo / "docs/tasks/todo/a.md"
+    task.write_text(task.read_text() + "x" * 30_000 + "\n")
+    out = run("brief", "a", cwd=repo).stdout
+    toc, note = out.rstrip().split("\n\n")
+    path = Path(note.rsplit(" ", 1)[1])
+    try:
+        brief = path.read_text()
+        assert note == f"The brief is {len(brief.encode())} bytes, too long to print in full: read it from {path}"
+        assert brief.startswith(toc + "\n") and "x" * 30_000 in brief
+    finally:
+        path.unlink()
 
 
 # Architecture decisions and business rules share one engine: the record tests run for both kinds.

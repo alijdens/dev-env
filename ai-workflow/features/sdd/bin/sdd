@@ -28,7 +28,9 @@ a task keeps it out of `sdd ready` like an unmet prerequisite. Ideas are never s
 input for a later planning session, ready to plan once the tasks in their `after:` are done.
 """
 import argparse
+import contextlib
 import datetime
+import io
 import json
 import os
 import re
@@ -53,6 +55,10 @@ LIVE_STATUSES = ("proposed", "accepted")
 ADR_MAX_LINES = 100
 CHECKS_SECTION = "Review checks"
 CHECKS_MAX = 10
+# What `sdd brief` leaves out of an ADR unless `--full`: the Decision binds the work, the reasoning around it rarely does.
+ADR_FULL_ONLY = ("Context", "Alternatives considered", "Consequences")
+# Claude Code's Bash tool truncates output past about 30,000 characters; an agent then needs another turn to read it all.
+BRIEF_MAX = 28_000
 AGENT_FILES = ("AGENTS.md", "CLAUDE.md")
 LIST_KEYS = ("after", "arch", "rules", "spec", "needs", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by", "into")
 LEGACY_STATUS_RE = re.compile(r"^- Status:\s*(.+?)\s*$", re.M)
@@ -1471,14 +1477,35 @@ def print_show(proj, slug, tasks, questions):
         print("ready: " + ("yes" if not blockers else "no, waiting on " + ", ".join(blockers)))
 
 
+def adr_summary(text):
+    """An ADR without its ADR_FULL_ONLY sections, and the names of those it had. Review checks are left out too:
+    `sdd brief` prints them in its review checks section."""
+    kept, omitted = [], []
+    for i, part in enumerate(re.split(r"^(?=## )", text, flags=re.M)):
+        name = part.split("\n", 1)[0][3:].strip()
+        if i and name in ADR_FULL_ONLY:
+            omitted.append(name)
+        elif not i or name != CHECKS_SECTION:
+            kept.append(part)
+    return "".join(kept), omitted
+
+
+def printed(fn, *args):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        fn(*args)
+    return out.getvalue().rstrip()
+
+
 def cmd_brief(args):
-    """Prints a task and everything linked to it in full, review checks included so a worker keeps them from the
-    start: what `working.md` asks a worker to read, and with `--review` what `reviewing.md` asks a reviewer to
-    read, in one bounded output instead of a dozen reads."""
+    """Prints a task and everything linked to it, review checks included so a worker keeps them from the start:
+    what `working.md` asks a worker to read, and with `--review` what `reviewing.md` asks a reviewer to read, in
+    one output instead of a dozen reads. A table of contents with sizes comes first, ADRs are cut to what binds
+    the work unless `--full`, and a brief too long for a tool to print in full goes to a file."""
     proj = find_project(args.dir)
     tasks, questions, specs = proj.tasks(), proj.questions(), proj.specs()
     t = proj.get(args.slug, tasks)
-    print_show(proj, args.slug, tasks, questions)
+    parts = [("status (sdd show)", printed(print_show, proj, args.slug, tasks, questions))]
     files = [("task", t.path)]
     for kind in KINDS:
         records = proj.records(kind)
@@ -1489,12 +1516,29 @@ def cmd_brief(args):
         files += [(name, doc_path(proj, name)) for name in PROJECT_DOCS if os.path.isfile(doc_path(proj, name))]
         files += [("dependent task", tasks[d].path) for d in Graph.from_tasks(tasks).dependents(args.slug)]
     for kind, path in files:
-        print(f"\n=== {kind}: {os.path.relpath(path, proj.root) if os.path.isabs(path) else path + ' (missing)'}\n")
-        if os.path.isabs(path):
-            with open(path) as f:
-                print(f.read().rstrip())
-    print("\n=== review checks (sdd checks --task)\n")
-    print_checks(proj, [], args.slug)
+        if not os.path.isabs(path):
+            parts.append((f"{kind}: {path} (missing)", ""))
+            continue
+        with open(path) as f:
+            text = f.read().rstrip()
+        title = f"{kind}: {os.path.relpath(path, proj.root)}"
+        if kind == ADR.label and not args.full:
+            text, omitted = adr_summary(text)
+            text = text.rstrip()
+            if omitted:
+                title += f" (without {', '.join(omitted)}: --full)"
+        parts.append((title, text))
+    parts.append(("review checks (sdd checks --task)", printed(print_checks, proj, [], args.slug)))
+
+    toc = "contents (bytes):\n" + "".join(f"  {len(text.encode()):>6}  {title}\n" for title, text in parts)
+    brief = toc + "".join(f"\n=== {title}\n\n{text}\n" for title, text in parts)
+    if len(brief) <= BRIEF_MAX:
+        print(brief, end="")
+        return
+    fd, path = tempfile.mkstemp(prefix=f"sdd-brief-{args.slug}-", suffix=".md")
+    with os.fdopen(fd, "w") as f:
+        f.write(brief)
+    print(f"{toc}\nThe brief is {len(brief.encode())} bytes, too long to print in full: read it from {path}")
 
 
 def cmd_ask(args):
@@ -2215,9 +2259,10 @@ def main():
     s.add_argument("slug")
     s.set_defaults(fn=cmd_show)
 
-    s = sub.add_parser("brief", help="print a task with its ADRs, specs, questions and review checks in full; --review adds goal, principles and dependents")
+    s = sub.add_parser("brief", help="print a task with its ADRs, rules, specs, questions and review checks, after a table of contents; --review adds goal, principles and dependents; to a file when too long to print")
     s.add_argument("slug")
     s.add_argument("--review", action="store_true", help="what a reviewer reads: also the project docs and the dependents' task files")
+    s.add_argument("--full", action="store_true", help="print ADRs whole, not only their Decision: also " + ", ".join(ADR_FULL_ONLY))
     s.set_defaults(fn=cmd_brief)
 
     s = sub.add_parser("doc", help="project docs (goal, principles): new writes the template, list shows their status, check fails on drafts")
