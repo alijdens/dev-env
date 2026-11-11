@@ -4,7 +4,7 @@ A session for the user to work through `questions/open/`, one question at a time
 
 ## Order
 
-Work on current main: in shared mode the session works in a worktree at `origin/main` with `--dir` (see the skill), since the lists below are only as complete as the files they read and each answer is shipped to main as it is made. Start with `sdd blockers`: the questions that alone keep a task from starting, with the work waiting behind each, most first. Then `sdd questions`, which lists the rest by priority: the ones blocking the most tasks first, then the ones linked to the most tasks, then the oldest. Walk those lists top to bottom; if the user names a question, task or ADR (`--task`, `--arch`), use that subset instead. Re-run the list after each question, since answering one can create tasks or questions.
+Work on current main: in shared mode the session works in a worktree at `origin/main` with `--dir` (see the skill), since the lists below are only as complete as the files they read and each answer is shipped to main as it is made. Start with `sdd blockers`: the questions that alone keep a task from starting, with the work waiting behind each, most first. Then `sdd questions`, which lists the rest by priority: the ones blocking the most tasks first, then the ones linked to the most tasks, then the oldest. Walk those lists top to bottom; if the user names a question, task or ADR (`--task`, `--arch`), use that subset instead, and if they ask for the stale ones, `sdd questions --stale` (see "Stale questions"). Re-run the list after each question, since answering one can create tasks or questions.
 
 ## One question at a time
 
@@ -23,6 +23,16 @@ For each question, in this order, stopping after each step for the user:
 6. **Ship** it, in shared mode: offer in one line to open a PR with this answer and merge it, with "PR only" and "later" as the alternatives. On a yes: `sdd ship --title "Answer <slug>: ..." --body "..." --merge`, the body following `../pull-requests.md` (a few lines quoting the answer and listing what it created); it commits the question's files and whatever the conversion created or edited, opens the PR and merges it, and if GitHub refuses it leaves the PR link to the user. On "PR only": the same without `--merge`. Either way the next question starts on a new branch from `origin/main` (`git fetch origin && git checkout -B answers/<next slug> origin/main` in the worktree), so each PR carries one answer. On "later": stay on the branch; the next Ship offer covers every unshipped answer in one PR. The user's yes is the authorization to merge that PR, no other.
 
 **Defer** is for "decided later, once X exists": `sdd defer <slug> --until <task>...` keeps the question open but out of the default list until those tasks are done, and any requirement the deferral imposes meanwhile goes into the task that must honor it (as `agent-transport` did for its registry). Don't mark such a question answered. **Skip** moves on without changes; the question keeps its place next time. **Stop** ends the session.
+
+## Stale questions
+
+An open question whose linked tasks are all done and that isn't deferred (`sdd questions --stale`, counted by `sdd validate`) was raised on work that shipped without it. Instead of the full interview, introduce each in a line or two and offer three outcomes:
+
+- **Moot**: the Answer says why (the code went another way, the case can't happen).
+- **Settled**: an ADR or business rule decided it since; the Answer names it.
+- **Still relevant**: link it to the live task it now concerns (`sdd link <slug> --task <task>`), which keeps it open and off the stale list; the user can also answer it now, as above.
+
+The first two close it with `sdd answer <slug>`, so it moves to `answered/` like any answer and a live task linking it shows the Answer in its brief.
 
 ## Ending
 

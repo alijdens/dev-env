@@ -256,6 +256,51 @@ def test_brief_too_long_to_print_goes_to_a_file(repo):
         path.unlink()
 
 
+def brief_titles(out, word="decision"):
+    return [line[4:].split(" (without")[0] for line in out.splitlines() if line.startswith("=== ") and word in line]
+
+
+def add_check(repo, name, check):
+    path = repo / f"docs/arch/{name}.md"
+    path.write_text(path.read_text() + f"\n## Review checks\n\n- {check}\n")
+
+
+def test_brief_follows_the_records_that_changed_a_linked_one(repo):
+    base = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    keys = adr(repo, "store-keys", "--title", "Keys", "--areas", "backend", "--amends", base)
+    ttl = adr(repo, "store-ttl", "--title", "TTL", "--areas", "web", "--amends", keys)
+    (repo / f"docs/arch/{ttl}.md").write_text((repo / f"docs/arch/{ttl}.md").read_text().replace("## Decision\n", "## Decision\n\nKeys expire.\n"))
+    add_check(repo, ttl, "Every key has a TTL.")
+    add_check(repo, adr(repo, "tokens", "--title", "Tokens", "--areas", "web"), "Colors come from tokens.")
+    run("new", "a", "--title", "A", "--arch", base, cwd=repo)
+    run("new", "b", "--title", "B", "--arch", base, keys, cwd=repo)
+
+    out = run("brief", "a", cwd=repo).stdout
+    assert brief_titles(out) == [f"architecture decision: arch/{base}.md", f"architecture decision, amends {base}: arch/{keys}.md",
+                                 f"architecture decision, amends {keys}: arch/{ttl}.md"]
+    assert "Keys expire." in out
+    checks = run("checks", "--task", "a", cwd=repo).stdout
+    assert "Every key has a TTL." in checks and "Colors come from tokens." not in checks  # the amendment's checks, not its area's
+    assert brief_titles(run("brief", "b", cwd=repo).stdout) == [  # a linked record is read at its own place, not as a follower
+        f"architecture decision: arch/{base}.md", f"architecture decision: arch/{keys}.md", f"architecture decision, amends {keys}: arch/{ttl}.md"]
+
+    newer = adr(repo, "store-redis", "--title", "Redis", "--supersedes", base)
+    out = run("brief", "a", cwd=repo).stdout
+    assert brief_titles(out) == [f"architecture decision: arch/{base}.md (superseded)", f"architecture decision, supersedes {base}: arch/{newer}.md"]
+    assert f"\n\nSuperseded by {newer}: read that instead.\n" in out
+
+
+def test_brief_prints_answered_questions_by_their_answer(repo):
+    run("new", "a", "--title", "A", cwd=repo)
+    path = Path(run("ask", "q", "--title", "Per key?", "--task", "a", cwd=repo).stdout.strip())
+    fill_question(path, answer="Per key.")
+    run("answer", "q", cwd=repo)
+    out = run("brief", "a", cwd=repo).stdout
+    assert brief_titles(out, "question") == ["question (answered): questions/answered/q.md"]
+    assert "(without Question, Context: --full)" in out and "Per key." in out and "See limits.py" not in out
+    assert "See limits.py" in run("brief", "a", "--full", cwd=repo).stdout
+
+
 # Architecture decisions and business rules share one engine: the record tests run for both kinds.
 Kind = namedtuple("Kind", "cmd dir label listing frozen")
 KINDS = [Kind("adr", "arch", "architecture decision", ["adrs"], "Decision"),
@@ -598,6 +643,21 @@ def test_defer_hides_a_question_until_its_tasks_are_done(repo, tmp_path):
     assert run("questions", cwd=repo).stdout.startswith("q\topen\tQ")
 
 
+def test_stale_questions_link_only_done_tasks(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    for slug in ("shipped", "live"):
+        run("new", slug, "--title", slug, cwd=repo)
+    run("start", "shipped", cwd=repo)
+    run("done", "shipped", cwd=repo)
+    store = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    for slug, links in (("stale", ["--task", "shipped"]), ("relinked", ["--task", "shipped", "--blocks", "live"]), ("on-live", ["--task", "live"]),
+                        ("on-a-decision", ["--arch", store]), ("deferred", ["--task", "shipped"])):
+        fill_question(Path(run("ask", slug, "--title", slug, *links, cwd=repo).stdout.strip()))
+    run("defer", "deferred", "--until", "live", cwd=repo)
+    assert [line.split("\t")[0] for line in run("questions", "--stale", cwd=repo).stdout.splitlines()] == ["stale"]
+    assert "warning: 1 open questions link only done tasks" in run("validate", cwd=repo).stdout
+
+
 # --- ideas ---------------------------------------------------------------------------------
 
 
@@ -738,6 +798,38 @@ def test_checks_collects_review_checks_by_area_or_task(repo):
     assert "over 10 review checks" in run("validate", cwd=repo).stdout
 
 
+def test_validate_warns_when_an_area_collects_too_many_review_checks(repo):
+    for i, area in enumerate(["backend/api", "backend/api", "backend/api", "backend/db"]):
+        path = repo / f"docs/arch/{adr(repo, f'r{i}', '--title', f'R{i}', '--areas', area)}.md"
+        path.write_text(path.read_text() + "\n## Review checks\n\n" + "".join(f"- c{j}\n" for j in range(7)))
+    out = run("validate", cwd=repo).stdout
+    assert "warning: area backend/api collects 21 review checks from 3 records" in out and "area backend/db" not in out
+
+
+def test_amended_adrs_are_listed_to_consolidate(repo):
+    base, other = adr(repo, "store", "--title", "Store"), adr(repo, "queue", "--title", "Queue")
+    own = adr(repo, "store-keys", "--title", "Keys", "--amends", base)
+    deep = adr(repo, "store-ttl", "--title", "TTL", "--amends", own)
+    shared = adr(repo, "store-queue", "--title", "Both", "--amends", base, other)
+    run("accept", base, other, own, shared, cwd=repo)
+    run("new", "a", "--title", "A", "--arch", deep, cwd=repo)
+    run("new", "b", "--title", "B", "--arch", other, cwd=repo)
+
+    assert run("adrs", "--amended", cwd=repo).stdout.splitlines() == [f"{base}\t3\t1\t{own},{deep} (proposed)\t{shared}", f"{other}\t1\t1\t\t{shared}"]
+    out = run("validate", cwd=repo).stdout
+    assert f"warning: {base} has 3 amendments, linked by 1 live tasks: consolidate it" in out and f"warning: {other} has" not in out
+
+    # Consolidating the store supersedes its own amendments; the shared one now changes only the queue.
+    adr(repo, "store-as-it-stands", "--title", "Store", "--supersedes", base, own, deep)
+    assert run("adrs", "--amended", cwd=repo).stdout.splitlines() == [f"{other}\t1\t1\t{shared}\t"]
+
+    # A legacy ADR has no frontmatter to record a successor in, so it can't be consolidated.
+    (repo / "docs/arch/0001-old.md").write_text("# Old\n\n- Status: accepted\n")
+    path = repo / f"docs/arch/{adr(repo, 'old-fix', '--title', 'Fix')}.md"
+    path.write_text(path.read_text().replace("amends: []", "amends: [0001-old]"))
+    assert "0001-old" not in run("adrs", "--amended", cwd=repo).stdout
+
+
 @each_kind
 def test_validate_refuses_edits_to_accepted_record_bodies(shared, kind):
     a = record(shared, kind, "fixed", "--title", "Fixed", "--areas", "x")
@@ -756,6 +848,37 @@ def test_validate_refuses_edits_to_accepted_record_bodies(shared, kind):
 
     path.write_text(path.read_text().replace(f"## {kind.frozen}\n", f"## {kind.frozen}\n\nchanged my mind\n"))
     assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+
+
+@each_kind
+def test_validate_lets_accepted_records_point_links_where_their_files_moved(shared, kind):
+    a = record(shared, kind, "linked", "--title", "Linked", "--areas", "x")
+    path = shared / f"docs/{kind.dir}/{a}.md"
+    path.write_text(path.read_text().replace("status: proposed", "status: accepted")
+                    .replace("## Alternatives considered\n", "## Alternatives considered\n\nnone really\n")
+                    .replace("## Rule\n", "## Rule\n\nA user posts at most 3 pictures a day.\n")
+                    .replace(f"## {kind.frozen}\n", f"## {kind.frozen}\n\nAs the [question](../questions/open/q.md) and the [docs](https://example.com/a) say, and `call[a](b)`.\n"))
+    commit_all(shared, "accept")
+    git("push", "-q", cwd=shared)
+
+    path.write_text(path.read_text().replace("../questions/open/q.md", "../questions/answered/q.md"))
+    assert "body changed" not in run("validate", cwd=shared).stdout
+
+    path.write_text(path.read_text().replace("[question]", "[answer]"))
+    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+    path.write_text(path.read_text().replace("[answer]", "[question]").replace("`call[a](b)`", "`call[a](c)`"))
+    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+    path.write_text(path.read_text().replace("`call[a](c)`", "`call[a](b)`").replace("example.com/a", "example.com/b"))
+    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+
+
+def test_validate_reads_no_links_in_code(repo, tmp_path):
+    data = tmp_path / "data"
+    run("init", "--local", data, cwd=repo)
+    run("new", "a", "--title", "A", cwd=repo)
+    task = data / "tasks/todo/a.md"
+    task.write_text(task.read_text() + "Call `Invoke[Req](ctx, cred)` or\n\n```go\nm[k](x)\n```\n\nsee [gone](../../gone.md).\n")
+    assert "links that don't resolve: ../../gone.md\n" in run("validate", cwd=repo).stdout
 
 
 # --- business rules ------------------------------------------------------------------------
@@ -1140,6 +1263,28 @@ def test_local_mode_claims_and_finishes_with_plain_moves(repo, tmp_path):
     run("done", "a", cwd=repo)
     assert states(repo)["a"].startswith("done/")
     assert git("status", "--porcelain", cwd=repo) == ""
+
+
+def test_moves_keep_relative_links_and_validate_flags_broken_ones(repo, tmp_path):
+    data = tmp_path / "data"
+    run("init", "--local", data, cwd=repo)
+    store = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    run("new", "a", "--title", "A", cwd=repo)
+    task = data / "tasks/todo/a.md"
+    task.write_text(task.read_text() + f"See [the store](../../arch/{store}.md#decision), [q](../../questions/open/q.md) and [docs](https://example.com).\n"
+                    "Call `Invoke[Req](ctx, cred)` or\n\n```go\nm[k](x)\n```\n")
+    question = Path(run("ask", "q", "--title", "Q", "--task", "a", cwd=repo).stdout.strip())
+    fill_question(question)
+    run("start", "a", cwd=repo)
+    run("done", "a", cwd=repo)
+    done = next((data / "tasks/done").glob("*/a.md"))
+    assert f"[the store](../../../arch/{store}.md#decision), [q](../../../questions/open/q.md) and [docs](https://example.com)" in done.read_text()
+    assert "`Invoke[Req](ctx, cred)`" in done.read_text() and "\nm[k](x)\n" in done.read_text()
+    assert "links that don't resolve" not in run("validate", cwd=repo).stdout
+
+    fill_question(question, answer="Yes.")
+    run("answer", "q", cwd=repo)  # a link to a question by its folder goes stale once it is answered
+    assert f"warning: {done}: links that don't resolve: ../../../questions/open/q.md\n" in run("validate", cwd=repo).stdout
 
 
 # --- blockers ------------------------------------------------------------------------------

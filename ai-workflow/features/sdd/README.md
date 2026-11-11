@@ -20,6 +20,10 @@ You drive it by asking your agent; the installed skills and the `sdd` CLI do the
 # 4. Answer the open questions: in another session while the run goes on (held PRs pick
 #    the answers up), or in the orchestrator's session once it reports
 /sdd-answer-questions
+
+# 5. Now and then, when `sdd validate` warns about it: consolidate amended ADRs, retire review
+#    checks tests enforce, close stale questions
+/sdd-maintenance
 ```
 
 Step by step:
