@@ -1,8 +1,8 @@
 ---
 name: sdd-maintenance
 description: >-
-  Shrinks what accumulates in a project's task workflow data, one item at a time with the user: consolidates amended ADRs into one record each, retires review checks that tests already enforce, closes stale open questions and fixes broken links.
-  Use when the user invokes /sdd-maintenance or asks to consolidate ADRs, clean up or maintain the task data, or act on the warnings `sdd validate` prints about them.
+  Shrinks what accumulates in a project's task workflow data, one item at a time with the user: restates ADRs that collected amendments or exceptions from what they are for, retires records that hold details and review checks that tests already enforce, deletes finished feature specs, trims specs that restate the code, closes stale open questions and fixes broken links.
+  Use when the user invokes /sdd-maintenance or asks to restate or consolidate ADRs, clean up or maintain the task data, or act on the warnings `sdd validate` prints about them.
 ---
 
 # Maintaining the Task Data

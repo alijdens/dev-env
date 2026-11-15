@@ -43,8 +43,8 @@ Merging a PR can make others conflict with main: the worker merges `origin/main`
 
 The orchestrator applies the plan; it doesn't change it. Three things are the user's, whatever the merge policy says:
 
-- **A finding that changes an accepted decision**, breaks a principle, or shows a criterion the code can't meet. It isn't resolved by picking a side, by "keep the behaviour and add a proposed ADR", or by rewording the criterion.
-- **A decision a worker added.** An implementation PR that adds a `proposed` ADR or business rule carries a decision the user hasn't seen: it may merge under the policy, but the report lists every such record under "decisions awaiting acceptance". One that amends or supersedes an accepted record is a hold (below).
+- **A finding that changes an accepted decision**, breaks a principle, or shows a criterion the code can't meet. It isn't resolved by picking a side, by "keep the behaviour and add a proposed ADR", by adding an exception to the record, or by rewording the criterion.
+- **A decision a worker added.** An implementation PR that adds a `proposed` ADR or business rule carries a decision the user hasn't seen: it may merge under the policy, but the report lists every such record under "decisions awaiting acceptance". One that supersedes an accepted record, or changes what one says, is a hold (below).
 - **Facts not in the plan.** Context added to a worker's prompt is quoted from the task, its ADRs, business rules, specs or questions, with the source named. What the orchestrator can't source that way isn't sent as context; if the worker needs it, it's a question.
 
 ### Held PRs

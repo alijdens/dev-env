@@ -215,6 +215,7 @@ def test_brief_prints_the_task_and_everything_linked_to_it(repo):
     run("adr", "store", "--title", "Store", cwd=repo)
     adr = next((repo / "docs/arch").glob("*-store.md"))
     adr.write_text(adr.read_text().replace("## Decision\n", "## Decision\n\nKeep it in Redis.\n")
+                   .replace("## Intent\n", "## Intent\n\nSessions survive a restart.\n")
                    .replace("## Context\n", "## Context\n\nSessions outgrew memory.\n") + "## Review checks\n\n- Every key has a TTL.\n")
     run("new", "a", "--title", "A", "--arch", adr.stem, cwd=repo)
     run("new", "b", "--title", "B", "--after", "a", cwd=repo)
@@ -229,6 +230,7 @@ def test_brief_prints_the_task_and_everything_linked_to_it(repo):
                                                        [("status (sdd show)", body.split("\n\n=== ")[0])] + list(sections.items())]
     assert body.startswith("slug: a\nstate: todo\n")
     assert f"=== {adr_title}\n\n" in out and "Keep it in Redis." in out and "Sessions outgrew memory." not in out
+    assert "Sessions survive a restart." in out
     assert "=== question (open): questions/open/ttl.md" in out and "=== task: tasks/todo/a.md" in out
     assert "tasks/todo/b.md" not in out and "=== goal" not in out
     assert out.count("Every key has a TTL.") == 1
@@ -302,9 +304,9 @@ def test_brief_prints_answered_questions_by_their_answer(repo):
 
 
 # Architecture decisions and business rules share one engine: the record tests run for both kinds.
-Kind = namedtuple("Kind", "cmd dir label listing frozen")
-KINDS = [Kind("adr", "arch", "architecture decision", ["adrs"], "Decision"),
-         Kind("rule", "rules", "business rule", ["rules", "--all"], "Rule")]
+Kind = namedtuple("Kind", "cmd dir label listing frozen flag")
+KINDS = [Kind("adr", "arch", "architecture decision", ["adrs"], "Decision", "--arch"),
+         Kind("rule", "rules", "business rule", ["rules", "--all"], "Rule", "--rule")]
 each_kind = pytest.mark.parametrize("kind", KINDS, ids=[k.cmd for k in KINDS])
 
 
@@ -554,10 +556,10 @@ def test_context_finds_the_adrs_cited_in_the_code_a_feature_touches(repo, tmp_pa
     assert cited in matching and other not in matching
 
 
-def test_feature_spec_has_the_planning_sections(repo):
+def test_specs_open_with_the_sections_their_readers_need(repo):
     path = Path(run("spec", "export", "--title", "Export", "--areas", "cli", "--feature", cwd=repo).stdout.strip())
     assert path.read_text().endswith("# Export\n\n## Goal\n\n## How it works\n\n## Shape\n")
-    assert "## Goal" not in Path(run("spec", "plain", "--title", "Plain", cwd=repo).stdout.strip()).read_text()
+    assert Path(run("spec", "plain", "--title", "Plain", cwd=repo).stdout.strip()).read_text().endswith("# Plain\n\n## Summary\n")
 
 
 def test_link_adds_references_to_done_tasks(repo, tmp_path):
@@ -768,7 +770,7 @@ def test_validate_flags_adrs_that_read_as_specs(repo):
     path.write_text(path.read_text() + "filler\n" * 100)
     out = run("validate", cwd=repo).stdout
     assert "over 100 lines" in out and "no alternatives" not in out
-    # Accepted, the body is history: the length can't be fixed any more, so it isn't nagged about.
+    # Accepted, the body changes only with the user's agreement, so the length isn't nagged about.
     path.write_text(path.read_text().replace("status: proposed", "status: accepted"))
     out = run("validate", cwd=repo).stdout
     assert "over 100 lines" not in out and "no alternatives considered" in out
@@ -798,6 +800,32 @@ def test_checks_collects_review_checks_by_area_or_task(repo):
     assert "over 10 review checks" in run("validate", cwd=repo).stdout
 
 
+def test_checks_for_a_task_are_those_its_brief_reads_not_its_areas(repo):
+    db = adr(repo, "migrations", "--title", "Migrations", "--areas", "backend/db")
+    add_check(repo, db, "Every migration has a down step.")
+    add_check(repo, adr(repo, "indexes", "--title", "Indexes", "--areas", "backend/db"), "Every index is named.")
+    add_check(repo, adr(repo, "migrations-locks", "--title", "Locks", "--areas", "web", "--amends", db), "Migrations take no table lock.")
+    old = adr(repo, "pool", "--title", "Pool", "--areas", "backend/db")
+    add_check(repo, old, "Old pool check.")
+    add_check(repo, adr(repo, "pool-v2", "--title", "Pool v2", "--areas", "ops", "--supersedes", old), "Pools are sized per host.")
+    write_spec(repo, "schema", "# Schema\n\n## Review checks\n\n- Tables have a primary key.\n", areas="backend/db")
+    write_spec(repo, "orm", "# ORM\n\n## Summary\n\nS.\n\n## Review checks\n\n- Queries go through the ORM.\n", areas="backend")
+    run("new", "t", "--title", "T", "--arch", db, old, "--spec", "schema", "--uses", "orm", cwd=repo)
+
+    own = ["Every migration has a down step.", "Migrations take no table lock.", "Pools are sized per host.", "Tables have a primary key."]
+    checks = run("checks", "--task", "t", cwd=repo).stdout
+    assert all(c in checks for c in own)
+    assert "Every index is named." not in checks and "Old pool check." not in checks and "Queries go through the ORM." not in checks
+    for args in ([], ["--review"]):
+        out = run("brief", "t", *args, cwd=repo).stdout.split("=== review checks (sdd checks --task)\n\n")[1]
+        assert out.rstrip() == checks.rstrip()
+
+    both = run("checks", "--task", "t", "--area", "backend/db", cwd=repo).stdout
+    assert all(both.count(c) == 1 for c in [*own, "Every index is named."])
+    by_area = run("checks", "--area", "backend/db", cwd=repo).stdout
+    assert "Every index is named." in by_area and "Migrations take no table lock." not in by_area
+
+
 def test_validate_warns_when_an_area_collects_too_many_review_checks(repo):
     for i, area in enumerate(["backend/api", "backend/api", "backend/api", "backend/db"]):
         path = repo / f"docs/arch/{adr(repo, f'r{i}', '--title', f'R{i}', '--areas', area)}.md"
@@ -817,7 +845,8 @@ def test_amended_adrs_are_listed_to_consolidate(repo):
 
     assert run("adrs", "--amended", cwd=repo).stdout.splitlines() == [f"{base}\t3\t1\t{own},{deep} (proposed)\t{shared}", f"{other}\t1\t1\t\t{shared}"]
     out = run("validate", cwd=repo).stdout
-    assert f"warning: {base} has 3 amendments, linked by 1 live tasks: consolidate it" in out and f"warning: {other} has" not in out
+    assert (f"warning: {base} has 3 amendments, linked by 1 live tasks: restate it in one record (maintenance.md; `sdd adrs --amended`)" in out
+            and f"warning: {other} has" not in out)
 
     # Consolidating the store supersedes its own amendments; the shared one now changes only the queue.
     adr(repo, "store-as-it-stands", "--title", "Store", "--supersedes", base, own, deep)
@@ -830,8 +859,188 @@ def test_amended_adrs_are_listed_to_consolidate(repo):
     assert "0001-old" not in run("adrs", "--amended", cwd=repo).stdout
 
 
+def test_record_templates_say_what_the_record_is_for(repo):
+    for kind, sections in ((KINDS[0], ["Intent", "Context", "Decision", "Alternatives considered", "Consequences"]),
+                           (KINDS[1], ["Rule", "Why", "Questions it answers"])):
+        text = (repo / f"docs/{kind.dir}/{record(repo, kind, kind.cmd + '-x', '--title', 'X')}.md").read_text()
+        assert [line[3:] for line in text.splitlines() if line.startswith("## ")] == sections
+
+
+@pytest.mark.parametrize("kind,section,fill", [(KINDS[0], "Intent", "Sessions survive a restart."),
+                                               (KINDS[1], "Questions it answers", "- Does a repost count? Yes.")], ids=["adr", "rule"])
+def test_validate_asks_proposed_records_what_they_are_for(repo, kind, section, fill):
+    name = record(repo, kind, "store", "--title", "Store", "--areas", "x")
+    path = repo / f"docs/{kind.dir}/{name}.md"
+    assert f"warning: {path}: empty or missing `## {section}`" in run("validate", cwd=repo, check=False).stdout
+    path.write_text(path.read_text().replace(f"## {section}\n", f"## {section}\n\n{fill}\n"))
+    assert f"`## {section}`" not in run("validate", cwd=repo, check=False).stdout
+    # Older accepted records have no such section: nothing to nag about.
+    path.write_text(path.read_text().replace(f"## {section}\n\n{fill}\n", "").replace("status: proposed", "status: accepted"))
+    assert f"`## {section}`" not in run("validate", cwd=repo, check=False).stdout
+
+
 @each_kind
-def test_validate_refuses_edits_to_accepted_record_bodies(shared, kind):
+def test_amending_warns_to_restate_the_record_instead(repo, kind):
+    old = record(repo, kind, "limits", "--title", "Limits")
+    r = run(kind.cmd, "limits-keys", "--title", "Keys", "--amends", old, cwd=repo)
+    assert (f"warning: {old} now has 1 amendments: a decision split over several records is read with all of them; "
+            f"when this change refines {old}, restate {old} in place instead (planning.md, \"Changing a record\")\n") == r.stderr
+    later = record(repo, kind, "limits-ttl", "--title", "TTL")
+    assert f"warning: {old} now has 2 amendments" in run("link", later, "--amends", old, cwd=repo).stderr
+    assert run(kind.cmd, "other", "--title", "Other", cwd=repo).stderr == ""
+
+
+def test_restating_a_record_supersedes_the_amendments_folded_into_it(repo):
+    base = adr(repo, "store", "--title", "Store")
+    keys = adr(repo, "store-keys", "--title", "Keys", "--amends", base)
+    ttl = adr(repo, "store-ttl", "--title", "TTL", "--amends", base)
+    run("accept", base, keys, ttl, cwd=repo)
+    run("new", "a", "--title", "A", "--arch", base, cwd=repo)
+    assert run("adrs", "--amended", cwd=repo).stdout.splitlines() == [f"{base}\t2\t1\t{keys},{ttl}\t"]
+
+    # The base now says what the keys amendment did; the TTL one still stands.
+    run("link", base, "--supersedes", keys, cwd=repo)
+    out = run("brief", "a", cwd=repo).stdout
+    assert brief_titles(out) == [f"architecture decision: arch/{base}.md", f"architecture decision, amends {base}: arch/{ttl}.md"]
+    assert "Superseded by" not in out
+    assert run("adrs", "--amended", cwd=repo).stdout.splitlines() == [f"{base}\t1\t1\t{ttl}\t"]
+    assert "error:" not in run("validate", cwd=repo).stdout
+
+
+@each_kind
+def test_retire_points_a_record_at_the_spec_that_describes_it_now(repo, kind):
+    run("spec", "keys", "--title", "Keys", cwd=repo)
+    detail = record(repo, kind, "key-format", "--title", "Key format", "--areas", "backend")
+    dropped = record(repo, kind, "dropped", "--title", "Dropped", "--areas", "backend")
+    fix = record(repo, kind, "dropped-fix", "--title", "Fix", "--areas", "backend", "--amends", dropped)
+    path = repo / f"docs/{kind.dir}/{detail}.md"
+    assert "unknown spec: nope" in fails("retire", detail, "--into", "nope", cwd=repo)
+    assert "status: proposed" in path.read_text()
+    assert run("retire", detail, "--into", "keys", cwd=repo).stdout == f"retired {detail}\n"
+    assert "status: retired" in path.read_text() and "into: [keys]" in path.read_text()
+    run("retire", dropped, cwd=repo)
+    assert "into:" not in (repo / f"docs/{kind.dir}/{dropped}.md").read_text()
+    assert f"{detail} is retired, not in force" in fails("retire", detail, cwd=repo)
+    assert "unknown architecture decision or business rule" in fails("retire", "nope", cwd=repo)
+    (repo / f"docs/{kind.dir}/0001-old.md").write_text("# Old\n\n- Status: accepted\n")
+    assert "has no frontmatter" in fails("retire", "0001-old", cwd=repo)
+    assert f"{detail}\tretired\t" in run(*kind.listing, cwd=repo).stdout
+
+    run("new", "a", "--title", "A", kind.flag, detail, dropped, cwd=repo)
+    out = run("brief", "a", cwd=repo).stdout
+    assert f"{kind.label}: {kind.dir}/{detail}.md (retired)\n\nRetired: a detail, now described in spec keys.\n" in out
+    assert f"{kind.label}: {kind.dir}/{dropped}.md (retired)\n\nRetired: no longer in force.\n" in out
+    assert fix not in out  # like a superseded record, a retired one isn't read with its amendments
+    (repo / "src").mkdir()
+    (repo / "src/keys.py").write_text(f"# {kind.cmd}: {detail}\n")
+    out = run("validate", cwd=repo, check=False).stdout
+    assert f"src/keys.py:1: cites {kind.cmd}: {detail}, retired: a detail, now described in spec keys" in out
+    assert "status must be one of" not in out and "no longer exists" not in out
+    (repo / "docs/specs/keys.md").unlink()
+    assert f"warning: {path}: retired into spec keys, which no longer exists" in run("validate", cwd=repo, check=False).stdout
+
+
+def test_retire_delete_removes_records_and_unlinks_them_from_what_is_live(repo):
+    docs = repo / "docs"
+    old = adr(repo, "old", "--title", "Old", "--areas", "backend")
+    keep = adr(repo, "keep", "--title", "Keep", "--areas", "backend")
+    fix = adr(repo, "old-fix", "--title", "Fix", "--amends", old)
+    newer = adr(repo, "newer", "--title", "Newer", "--supersedes", old)  # any status goes: old is superseded now
+    cap = record(repo, KINDS[1], "cap", "--title", "Cap")
+    run("new", "live", "--title", "Live", "--arch", old, keep, "--rule", cap, cwd=repo)
+    run("new", "shipped", "--title", "Shipped", "--arch", old, cwd=repo)
+    (docs / "tasks/done/2026-01-01").mkdir(parents=True)
+    (docs / "tasks/todo/shipped.md").rename(docs / "tasks/done/2026-01-01/shipped.md")
+    run("spec", "s", "--title", "S", "--areas", "backend", "--arch", old, cwd=repo)
+    for slug, task in (("q", "live"), ("qa", "shipped")):
+        fill_question(Path(run("ask", slug, "--title", slug, "--task", task, "--arch", old, cwd=repo).stdout.strip()), answer="Yes." if slug == "qa" else "")
+    run("answer", "qa", cwd=repo)
+    for slug in ("io", "ic"):
+        fill_idea(Path(run("idea", slug, "--title", slug, "--areas", "backend", "--arch", old, cwd=repo).stdout.strip()), outcome="Dropped." if slug == "ic" else "")
+    run("close-idea", "ic", cwd=repo)
+    (repo / "src").mkdir()
+    (repo / "src/x.py").write_text(f"# adr: {old}\n")
+    legacy = docs / "arch/2020-01-01-legacy.md"
+    legacy.write_text(f"# Legacy\n\n- Status: superseded by {old}\n")  # no frontmatter to unlink it from: left as written
+    live = {"task": docs / "tasks/todo/live.md", "spec": docs / "specs/s.md", "question": docs / "questions/open/q.md", "idea": docs / "ideas/open/io.md"}
+    history = [docs / "tasks/done/2026-01-01/shipped.md", docs / "questions/answered/qa.md", docs / "ideas/closed/ic.md", legacy]
+    before = {p: p.read_text() for p in [*live.values(), *history]}
+
+    assert "unknown architecture decision or business rule: nope" in fails("retire", old, "nope", "--delete", cwd=repo)
+    assert "not allowed with argument" in fails("retire", old, "--delete", "--into", "s", cwd=repo)
+    assert (docs / f"arch/{old}.md").is_file() and {p: p.read_text() for p in before} == before
+
+    out = run("retire", old, cap, "--delete", cwd=repo).stdout.splitlines()
+    assert sorted(out) == sorted([f"unlinked {old}, {cap} from {live['task']}", *(f"unlinked {old} from {p}" for p in list(live.values())[1:]),
+                                  f"unlinked {old} from {docs / f'arch/{fix}.md'}", f"unlinked {old} from {docs / f'arch/{newer}.md'}",
+                                  f"deleted {docs / f'arch/{old}.md'}", f"deleted {docs / f'rules/{cap}.md'}"])
+    assert not (docs / f"arch/{old}.md").exists() and not (docs / f"rules/{cap}.md").exists()
+    assert f"arch: [{keep}]\nrules: []" in live["task"].read_text()
+    assert "amends: []" in (docs / f"arch/{fix}.md").read_text() and "supersedes: []" in (docs / f"arch/{newer}.md").read_text()
+    assert all(p.read_text() == before[p] for p in history)
+
+    out = run("validate", cwd=repo).stdout
+    assert "error:" not in out and f"src/x.py:1: cites adr: {old}, which doesn't exist" in out
+    assert f"{old} (missing)" in run("show", "shipped", cwd=repo).stdout
+    assert f"=== architecture decision: {old} (missing)" in run("brief", "shipped", cwd=repo).stdout
+    run("context", "--area", "backend", cwd=repo)
+
+    for p in live.values():
+        p.write_text(p.read_text().replace("arch: [", f"arch: [{old}, ", 1))
+    errors = [line for line in run("validate", cwd=repo, check=False).stdout.splitlines() if line.startswith("error:")]
+    assert sorted(errors) == sorted(f"error: {p}: unknown architecture decision {old}" for p in live.values())
+
+    assert run("retire", "2020-01-01-legacy", "--delete", cwd=repo).stdout == f"deleted {legacy}\n"
+
+
+def test_retired_rules_are_not_in_force(repo):
+    rule = record(repo, KINDS[1], "cap", "--title", "Cap", "--areas", "posting")
+    run("retire", rule, cwd=repo)
+    assert run("rules", cwd=repo).stdout == ""
+    assert run("rules", "--all", cwd=repo).stdout.startswith(f"{rule}\tretired\t")
+    assert rule not in run("context", "--area", "posting", cwd=repo).stdout
+
+
+def test_validate_warns_when_a_feature_spec_outlives_its_tasks(repo, tmp_path):
+    run("init", "--local", tmp_path / "data", cwd=repo)
+    run("spec", "export", "--title", "Export", "--areas", "cli", "--feature", cwd=repo)
+    run("spec", "cli", "--title", "CLI", "--areas", "cli", cwd=repo)
+    run("spec", "unplanned", "--title", "Unplanned", "--areas", "cli", "--feature", cwd=repo)
+    for slug in ("a", "b"):
+        run("new", slug, "--title", slug.upper(), "--spec", "export", "cli", cwd=repo)
+        run("start", slug, cwd=repo)
+    run("done", "a", cwd=repo)
+    assert "tasks are all done" not in run("validate", cwd=repo).stdout
+    run("done", "b", cwd=repo)
+    out = run("validate", cwd=repo).stdout
+    assert (f"warning: {tmp_path / 'data/specs/export.md'}: a feature spec whose tasks are all done; move what lasts to component specs, "
+            "ADRs and rules, then delete it (maintenance.md)") in out
+    assert out.count("tasks are all done") == 1
+
+
+def test_a_deleted_feature_spec_is_history_for_done_tasks_and_closed_ideas(repo, tmp_path):
+    data = tmp_path / "data"
+    run("init", "--local", data, cwd=repo)
+    run("spec", "export", "--title", "Export", "--areas", "cli", "--feature", cwd=repo)
+    run("new", "a", "--title", "A", "--spec", "export", cwd=repo)
+    run("new", "b", "--title", "B", "--spec", "export", cwd=repo)
+    fill_idea(Path(run("idea", "csv", "--title", "CSV", "--areas", "cli", cwd=repo).stdout.strip()), outcome="Planned as export.")
+    run("close-idea", "csv", "--into", "export", "a", cwd=repo)
+    run("start", "a", cwd=repo)
+    run("done", "a", cwd=repo)
+    (data / "specs/export.md").unlink()
+
+    out = run("validate", cwd=repo, check=False).stdout
+    assert [line for line in out.splitlines() if line.startswith("error:")] == [f"error: {data / 'tasks/todo/b.md'}: unknown spec export"]
+    run("rm", "b", cwd=repo)
+    run("validate", cwd=repo)
+    assert "specs:\n  export (missing)" in run("show", "a", cwd=repo).stdout
+    assert "=== spec: export (missing)" in run("brief", "a", cwd=repo).stdout
+    assert "  csv\tclosed\tCSV" in run("context", "--area", "cli", cwd=repo).stdout
+
+
+@each_kind
+def test_validate_warns_about_edits_to_accepted_record_bodies(shared, kind):
     a = record(shared, kind, "fixed", "--title", "Fixed", "--areas", "x")
     path = shared / f"docs/{kind.dir}/{a}.md"
     path.write_text(path.read_text().replace("status: proposed", "status: accepted")
@@ -847,7 +1056,7 @@ def test_validate_refuses_edits_to_accepted_record_bodies(shared, kind):
     assert "body changed" not in run("validate", cwd=shared).stdout
 
     path.write_text(path.read_text().replace(f"## {kind.frozen}\n", f"## {kind.frozen}\n\nchanged my mind\n"))
-    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+    assert f"warning: {path}: body changed since origin/main; changing an accepted {kind.label} is the user's call" in run("validate", cwd=shared).stdout
 
 
 @each_kind
@@ -865,11 +1074,11 @@ def test_validate_lets_accepted_records_point_links_where_their_files_moved(shar
     assert "body changed" not in run("validate", cwd=shared).stdout
 
     path.write_text(path.read_text().replace("[question]", "[answer]"))
-    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+    assert "body changed since origin/main" in run("validate", cwd=shared).stdout
     path.write_text(path.read_text().replace("[answer]", "[question]").replace("`call[a](b)`", "`call[a](c)`"))
-    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+    assert "body changed since origin/main" in run("validate", cwd=shared).stdout
     path.write_text(path.read_text().replace("`call[a](c)`", "`call[a](b)`").replace("example.com/a", "example.com/b"))
-    assert "body changed since origin/main" in run("validate", cwd=shared, check=False).stdout
+    assert "body changed since origin/main" in run("validate", cwd=shared).stdout
 
 
 def test_validate_reads_no_links_in_code(repo, tmp_path):
@@ -979,6 +1188,128 @@ def test_validate_warns_about_empty_feature_specs(repo):
     assert "empty `## Goal` section" in out and "empty `## How it works` section" in out
     path.write_text(path.read_text().replace("## Goal\n", "## Goal\n\nG\n").replace("## How it works\n", "## How it works\n\nH\n"))
     assert "empty `## Goal`" not in run("validate", cwd=repo).stdout
+
+
+def write_spec(repo, slug, body, areas="auth"):
+    path = Path(run("spec", slug, "--title", slug.capitalize(), "--areas", areas, cwd=repo).stdout.strip())
+    path.write_text(path.read_text().split("\n# ")[0] + "\n" + body)
+    return path
+
+
+def test_uses_links_a_spec_a_task_only_relies_on(repo):
+    perms = write_spec(repo, "perms", "# Perms\n\nIntro line.\n\n## Summary\n\nWho may do what.\n\n## Model\n\nRoles and grants.\n\n"
+                                      "## Review checks\n\n- Every grant is audited.\n")
+    other = write_spec(repo, "other", "# Other\n\nOther intro.\n\n## Model\n\nDetails.\n", areas="billing")
+    grants = adr(repo, "grants", "--title", "Grants", "--areas", "auth")
+    add_check(repo, grants, "Grants are stored centrally.")
+    run("new", "a", "--title", "A", "--uses", "perms", "other", cwd=repo)
+    run("new", "b", "--title", "B", cwd=repo)
+    assert "uses: [perms, other]" in (repo / "docs/tasks/todo/a.md").read_text() and "uses:" not in (repo / "docs/tasks/todo/b.md").read_text()
+    assert "unknown spec: nope" in fails("new", "c", "--title", "C", "--uses", "nope", cwd=repo)
+    assert "\nuses:" not in run("show", "b", cwd=repo).stdout
+    run("link", "b", "--uses", "perms", cwd=repo)
+    assert "uses: [perms]" in (repo / "docs/tasks/todo/b.md").read_text()
+    assert "unknown spec: nope" in fails("link", "b", "--uses", "nope", cwd=repo)
+    assert f"uses:\n  {perms}\n  {other}\n" in run("show", "a", cwd=repo).stdout
+    run("new", "both", "--title", "Both", "--spec", "perms", "--uses", "perms", cwd=repo)
+
+    out = run("brief", "a", cwd=repo).stdout
+    assert "=== spec (uses): specs/perms.md (summary only: --full)\n\n## Summary\n\nWho may do what.\n\n===" in out
+    assert "=== spec (uses): specs/other.md (summary only: --full)\n\n# Other\n\nOther intro.\n\n===" in out
+    assert "Roles and grants." not in out and "Details." not in out
+    # Neither the spec's checks nor those of its areas come with it.
+    assert "Every grant is audited." not in out and "Grants are stored centrally." not in out
+    checks = run("checks", "--task", "a", cwd=repo).stdout
+    assert "Every grant is audited." not in checks and "Grants are stored centrally." not in checks
+    full = run("brief", "a", "--full", cwd=repo).stdout
+    assert "=== spec (uses): specs/perms.md\n\n" in full and "Roles and grants." in full and "Details." in full
+
+    both = run("brief", "both", cwd=repo).stdout
+    assert [line for line in both.splitlines() if line.startswith("=== spec")] == ["=== spec: specs/perms.md"]
+    assert "Roles and grants." in both and "Every grant is audited." in run("checks", "--task", "both", cwd=repo).stdout
+
+    assert "  a\ttodo\tA" in run("context", "--area", "auth", cwd=repo).stdout.split("tasks referencing")[1]
+
+
+def test_validate_checks_uses_links_and_summaries(repo, tmp_path):
+    data = tmp_path / "data"
+    run("init", "--local", data, cwd=repo)
+    perms = Path(run("spec", "perms", "--title", "Perms", "--areas", "auth", cwd=repo).stdout.strip())
+    run("spec", "export", "--title", "Export", "--areas", "cli", "--feature", cwd=repo)
+    run("spec", "plain", "--title", "Plain", "--areas", "cli", cwd=repo)
+    run("new", "a", "--title", "A", "--uses", "perms", cwd=repo)
+    run("new", "f1", "--title", "F1", "--spec", "export", cwd=repo)
+    run("new", "f2", "--title", "F2", "--uses", "export", cwd=repo)
+    out = run("validate", cwd=repo).stdout
+    assert f"warning: {perms}: live tasks use it (`uses:`) but it has no `## Summary`" in out
+    assert "export.md: live tasks use it" in out  # a feature spec used by a task needs one too
+    assert "plain.md: live tasks use it" not in out
+
+    perms.write_text(perms.read_text().replace("## Summary\n", "## Summary\n\nWho may do what.\n"))
+    assert f"{perms}: live tasks use it" not in run("validate", cwd=repo).stdout
+    perms.write_text(perms.read_text().replace("Who may do what.\n", "line\n" * 16))
+    assert f"warning: {perms}: `## Summary` over 15 lines" in run("validate", cwd=repo).stdout
+
+    for slug in ("f1", "f2"):
+        run("start", slug, cwd=repo)
+    run("done", "f1", cwd=repo)
+    assert "tasks are all done" not in run("validate", cwd=repo).stdout  # f2 still uses it
+    run("done", "f2", cwd=repo)
+    assert "export.md: a feature spec whose tasks are all done" in run("validate", cwd=repo).stdout
+
+    (data / "tasks/todo/a.md").write_text((data / "tasks/todo/a.md").read_text().replace("uses: [perms]", "uses: [perms, ghost]"))
+    done = next((data / "tasks/done").glob("*/f2.md"))
+    done.write_text(done.read_text().replace("uses: [export]", "uses: [export, gone]"))
+    errors = [line for line in run("validate", cwd=repo, check=False).stdout.splitlines() if line.startswith("error:")]
+    assert errors == [f"error: {data / 'tasks/todo/a.md'}: unknown spec ghost"]
+
+
+def toc_sizes(out):
+    """{part title: bytes} from a brief's table of contents."""
+    lines = out.split("\n\n")[0].splitlines()[1:]
+    return {line[10:]: int(line[:8]) for line in lines}
+
+
+def test_cost_ranks_docs_by_what_they_add_to_the_live_briefs(repo):
+    base = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    path = repo / f"docs/arch/{base}.md"
+    path.write_text(path.read_text().replace("## Context\n", "## Context\n\n" + "Background. " * 50 + "\n").replace("## Decision\n", "## Decision\n\nRedis.\n"))
+    keys = adr(repo, "store-keys", "--title", "Keys", "--areas", "backend", "--amends", base)
+    write_spec(repo, "perms", "# Perms\n\n## Summary\n\nWho may do what.\n\n## Model\n\n" + "Roles. " * 100 + "\n")
+    run("new", "t1", "--title", "T1", "--arch", base, "--spec", "perms", cwd=repo)
+    run("new", "t2", "--title", "T2", "--arch", base, "--uses", "perms", cwd=repo)
+    run("new", "t3", "--title", "T3", "--uses", "perms", cwd=repo)
+    run("new", "shipped", "--title", "Shipped", "--arch", base, "--spec", "perms", cwd=repo)
+    (repo / "docs/tasks/done/2026-01-01").mkdir(parents=True)
+    (repo / "docs/tasks/todo/shipped.md").rename(repo / "docs/tasks/done/2026-01-01/shipped.md")
+
+    toc = {slug: toc_sizes(run("brief", slug, cwd=repo).stdout) for slug in ("t1", "t2", "t3")}
+    sizes = {slug: sum(t.values()) for slug, t in toc.items()}
+    adr_bytes = toc["t1"][f"architecture decision: arch/{base}.md (without Context, Alternatives considered, Consequences: --full)"]
+    keys_bytes = toc["t1"][f"architecture decision, amends {base}: arch/{keys}.md (without Context, Alternatives considered, Consequences: --full)"]
+    whole, part = toc["t1"]["spec: specs/perms.md"], toc["t2"]["spec (uses): specs/perms.md (summary only: --full)"]
+    ordered = sorted(sizes.values())
+    largest = max(sizes, key=lambda s: sizes[s])
+
+    out = run("cost", cwd=repo).stdout.splitlines()
+    assert out[0] == f"3 live tasks, brief bytes: median {ordered[1]}, 90th percentile {ordered[2]}, largest {sizes[largest]} ({largest})"
+    rows = sorted([[whole + 2 * part, whole, 3, "spec", "perms"], [2 * adr_bytes, adr_bytes, 2, "adr", base], [2 * keys_bytes, keys_bytes, 2, "adr", keys]],
+                  key=lambda r: (-r[0], r[4]))
+    assert out[1:] == ["\t".join(map(str, r)) for r in rows]
+    assert run("cost", "--top", "1", cwd=repo).stdout.splitlines()[1:] == out[1:2]
+    assert [line.split("\t")[4] for line in run("cost", "--area", "auth", cwd=repo).stdout.splitlines()[1:]] == ["perms"]
+
+
+def test_validate_warns_when_the_median_brief_is_long(repo):
+    run("new", "big", "--title", "Big", cwd=repo)
+    task = repo / "docs/tasks/todo/big.md"
+    task.write_text(task.read_text() + "x" * 15_000 + "\n")
+    size = sum(toc_sizes(run("brief", "big", cwd=repo).stdout).values())
+    assert (f"warning: the median brief of the 1 live tasks is {size} bytes, over half of the 28000 a tool prints in full: "
+            "`sdd cost` shows the docs that cost the most to read (maintenance.md)") in run("validate", cwd=repo).stdout
+    for slug in ("s1", "s2"):
+        run("new", slug, "--title", slug, cwd=repo)
+    assert "median brief" not in run("validate", cwd=repo).stdout
 
 
 def test_validate_warns_when_agent_section_is_outdated(repo):

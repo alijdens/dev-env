@@ -26,7 +26,7 @@ The agent writes the doc; the user supplies the facts. Section by section, in th
 Keep the user inside the doc's scope. When an answer drifts, say where it belongs and carry on:
 
 - Implementation detail or architecture ("we use Postgres with a queue in front"): an ADR, or at most a line under principles' stack section if it's a commitment.
-- A product rule of one domain ("a user posts at most 3 pictures a day"): a business rule (`sdd rule`), not a principle.
+- What the product wants in one domain ("external calendars stay in sync with ours"): a business rule (`sdd rule`), not a principle. Write it down then and there, in the user's words: such statements are what later sessions settle open cases from, and the interview is where the user says them.
 - A decision made during the conversation ("let's go with per-key limits"): an ADR, once there's a feature to attach it to.
 - A feature or piece of work ("we need an admin page"): a task or a spec, not a goal.
 - A preference without a consequence ("we like clean code"): drop it; a principle a reviewer can't check is noise.
@@ -40,7 +40,7 @@ When the sections are confirmed: remove the template comments, write the file, r
 
 Read the current doc first and show it, then ask what changed instead of re-interviewing from scratch. Edit only the sections the change touches, keep the limits, and re-run `sdd doc check`.
 
-A changed goal or principle can invalidate planned work: after the edit, go through `sdd list` and the accepted ADRs and list the ones that no longer fit (a task serving a dropped goal, an ADR relying on a dropped principle). Report them; the user decides whether to re-plan (`sdd-planning` skill) or leave them. Don't rewrite history: an ADR that a new principle overrides gets a new ADR superseding it, not an edit.
+A changed goal or principle can invalidate planned work: after the edit, go through `sdd list` and the accepted ADRs and list the ones that no longer fit (a task serving a dropped goal, an ADR relying on a dropped principle). Report them; the user decides whether to re-plan (`sdd-planning` skill) or leave them. An ADR that a new principle overrides is changed with the user as `planning.md`, "Changing a record", says.
 
 ## Who checks what
 

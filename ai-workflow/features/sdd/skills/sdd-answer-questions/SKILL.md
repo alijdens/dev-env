@@ -1,7 +1,7 @@
 ---
 name: sdd-answer-questions
 description: >-
-  Walks the user through the project's open questions one at a time, with just enough context per question, records the answers and converts them into tasks or ADRs.
+  Walks the user through the project's open questions one at a time, with just enough context per question, records the answers and converts them into tasks, changed records or, rarely, new ADRs and business rules.
   Use only when the user invokes /sdd-answer-questions or asks to go through, triage, or answer the open questions of a project that uses the task workflow.
 ---
 

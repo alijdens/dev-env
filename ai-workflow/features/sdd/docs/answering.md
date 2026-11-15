@@ -14,9 +14,11 @@ For each question, in this order, stopping after each step for the user:
 2. **Expand** when asked, progressively: first the full Context section and the assumption taken meanwhile; then, if asked further, the linked task's Goal and acceptance criteria, the linked ADRs' Decision sections, and the code the Context points at. Answer the user's questions about it; this is a conversation, not a briefing.
 3. **Record** the answer once the user gives one: write it under `## Answer` in the user's terms, tightened, including the reasoning if they gave one, and show it in a line for confirmation.
 4. **Convert** the answer into work or decisions, proposing in one line and acting on a yes:
-   - It changes or makes an architecture decision: a new ADR (`sdd adr`), superseding the old one if any, linked from the Answer. A product rule the code must keep from now on ("at most 3 pictures a day") is a business rule instead (`sdd rule`), handled the same way. Re-planning the affected tasks is the `sdd-planning` skill; say so rather than doing it here, and hold each affected task with a blocking question meanwhile (`sdd ask replan-<slug> --title "Re-plan <slug> after <record>" --blocks <slug> --arch <adr>` or `--rule <rule>`, Context saying what changed), so nobody claims it before the re-plan; a Notes line doesn't keep it out of `sdd ready`.
+   - It changes a decision or a rule already recorded: change that record as `planning.md`, "Changing a record", says (restated in place, or superseded when the decision is a different one, never an exception added to it), show the user the new statement, and link it from the Answer.
+   - It makes a decision that passes the test in `planning.md`, "Architecture decisions": a new ADR (`sdd adr`), linked from the Answer. When what the user said is general enough to answer other questions too ("our calendar and theirs stay in sync"), it is a business rule (`sdd rule`), in their words. Most answers are neither: they settle a detail, and go to the task or the spec below. For either kind of record, re-planning the affected tasks is the `sdd-planning` skill; say so rather than doing it here, and hold each affected task with a blocking question meanwhile (`sdd ask replan-<slug> --title "Re-plan <slug> after <record>" --blocks <slug> --arch <adr>` or `--rule <rule>`, Context saying what changed), so nobody claims it before the re-plan; a Notes line doesn't keep it out of `sdd ready`.
    - It needs work that no task covers: `sdd new` (tech-debt when it's a follow-up), with `--after` and `--arch` as needed, and a Goal that quotes the answer. Work that needs designing first is an idea instead (`sdd idea`, see `overview.md`), its Context quoting the answer.
    - It changes what an existing task must do: edit that task's Notes or acceptance criteria, in a line that cites the question.
+   - It settles a detail of how something works: a line in the component's spec if a later reader needs it, otherwise nothing beyond the Answer.
    - It only unblocks: nothing to convert.
    - It's obsolete (the code moved on, the task was dropped): the Answer says so and why.
 5. **Close** it with `sdd answer <slug>` and say which tasks became ready if any (`sdd ready`).
@@ -29,7 +31,7 @@ For each question, in this order, stopping after each step for the user:
 An open question whose linked tasks are all done and that isn't deferred (`sdd questions --stale`, counted by `sdd validate`) was raised on work that shipped without it. Instead of the full interview, introduce each in a line or two and offer three outcomes:
 
 - **Moot**: the Answer says why (the code went another way, the case can't happen).
-- **Settled**: an ADR or business rule decided it since; the Answer names it.
+- **Settled**: an ADR or business rule decided it since, or already answered it; the Answer names it.
 - **Still relevant**: link it to the live task it now concerns (`sdd link <slug> --task <task>`), which keeps it open and off the stale list; the user can also answer it now, as above.
 
 The first two close it with `sdd answer <slug>`, so it moves to `answered/` like any answer and a live task linking it shows the Answer in its brief.

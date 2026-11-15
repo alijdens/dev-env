@@ -11,7 +11,7 @@ The local config wins when both are present. `--dir <path>` overrides both, for 
 anywhere else: shared mode if <path> is inside a git repo, local mode otherwise.
 
 Layout under the data root:
-  arch/YYYY-MM-DD-<slug>.md              architecture decision records (immutable once accepted)
+  arch/YYYY-MM-DD-<slug>.md              architecture decision records (once accepted, edited only with the user's agreement)
   rules/YYYY-MM-DD-<slug>.md             business rules, the same kind of record for product rules
   specs/<slug>.md                        living descriptions of how things are, updated by PRs
   tasks/{todo,in-progress,tech-debt}/<slug>.md
@@ -30,11 +30,13 @@ input for a later planning session, ready to plan once the tasks in their `after
 import argparse
 import contextlib
 import datetime
+import functools
 import io
 import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -51,7 +53,7 @@ OPEN_STATES = ("todo", "in-progress", "tech-debt")
 STARTABLE = ("todo", "tech-debt")
 QUESTION_STATES = ("open", "answered")
 IDEA_STATES = ("open", "closed")
-RECORD_STATUSES = ("proposed", "accepted", "superseded", "deprecated")
+RECORD_STATUSES = ("proposed", "accepted", "superseded", "retired", "deprecated")
 LIVE_STATUSES = ("proposed", "accepted")
 ADR_MAX_LINES = 100
 CHECKS_SECTION = "Review checks"
@@ -59,7 +61,7 @@ CHECKS_MAX = 10
 # Past these `sdd validate` points at maintenance.md: every worker and reviewer reads what they count.
 CHECKS_AREA_MAX = 20
 AMENDMENTS_MAX = 1
-# What `sdd brief` leaves out of an ADR unless `--full`: the Decision binds the work, the reasoning around it rarely does.
+# What `sdd brief` leaves out of an ADR unless `--full`: the Intent and Decision bind the work, the reasoning around them rarely does.
 ADR_FULL_ONLY = ("Context", "Alternatives considered", "Consequences")
 # Likewise for an answered question: the Question and Context were for whoever answered it.
 ANSWERED_FULL_ONLY = ("Question", "Context")
@@ -70,8 +72,9 @@ FENCE_RE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
 CODE_SPAN_RE = re.compile(r"(`+)[^\n]*?\1")
 # Claude Code's Bash tool truncates output past about 30,000 characters; an agent then needs another turn to read it all.
 BRIEF_MAX = 28_000
+SUMMARY_MAX_LINES = 15
 AGENT_FILES = ("AGENTS.md", "CLAUDE.md")
-LIST_KEYS = ("after", "arch", "rules", "spec", "needs", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by", "into")
+LIST_KEYS = ("after", "arch", "rules", "spec", "uses", "needs", "tasks", "blocks", "revisit", "areas", "supersedes", "amends", "superseded-by", "amended-by", "into")
 LEGACY_STATUS_RE = re.compile(r"^- Status:\s*(.+?)\s*$", re.M)
 LEGACY_DATE_RE = re.compile(r"^- Date:\s*(\S+)\s*$", re.M)
 LOCAL_KEY = "sdd.root"
@@ -102,6 +105,8 @@ amends: [{amends}]
 
 # {title}
 
+## Intent
+
 ## Context
 
 ## Decision
@@ -126,7 +131,7 @@ amends: [{amends}]
 
 ## Why
 
-## Alternatives considered
+## Questions it answers
 """
 SPEC_TEMPLATE = """\
 ---
@@ -138,6 +143,10 @@ rules: [{rules}]
 
 # {title}
 """
+# A component spec opens with what a task that only relies on the component reads (`uses:`), so it can skip the rest.
+COMPONENT_SPEC_SECTIONS = """
+## Summary
+"""
 # The planning session's agreed proposal: the target its tasks are implemented and reviewed against until the last
 # one is done. No review checks: what must hold later lives in component specs, ADRs and business rules.
 FEATURE_SPEC_SECTIONS = """
@@ -147,8 +156,9 @@ FEATURE_SPEC_SECTIONS = """
 
 ## Shape
 """
-# Architecture decisions and business rules are the same kind of record: dated, proposed then accepted,
-# frozen once accepted, amended or superseded by newer ones, and cited from the code that follows them.
+# Architecture decisions and business rules are the same kind of record: dated, proposed then accepted, edited in
+# place once accepted only with the user's agreement, superseded by newer ones or retired into a spec, and cited from
+# the code that follows them.
 # They differ in what they hold and in how planning finds them: rules bind features in any area.
 Kind = namedtuple("Kind", "name label dir link opt cite template")
 ADR = Kind("adr", "architecture decision", "arch", "arch", "arch", "adr", ADR_TEMPLATE)
@@ -566,6 +576,40 @@ class Project:
         return dest
 
 
+class Loaded:
+    """The data root read once and the briefs' parts rendered once, for commands that build many briefs."""
+
+    def __init__(self, proj):
+        self.proj = proj
+        self.rendered = {}
+        self.checks = {}
+
+    @functools.cached_property
+    def tasks(self):
+        return self.proj.tasks()
+
+    @functools.cached_property
+    def questions(self):
+        return self.proj.questions()
+
+    @functools.cached_property
+    def specs(self):
+        return self.proj.specs()
+
+    @functools.cached_property
+    def records(self):
+        return self.proj.all_records()
+
+    @functools.cached_property
+    def graph(self):
+        return Graph.from_tasks(self.tasks)
+
+    def review_checks(self, path):
+        if path not in self.checks:
+            self.checks[path] = review_checks(path)[0]
+        return self.checks[path]
+
+
 def without_code(text):
     """`text` with fenced blocks and code spans blanked, so code like `f[a](b)` isn't read as a link."""
     blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))
@@ -615,7 +659,8 @@ def record_meta(path):
 
 
 def record_body(text):
-    """An accepted record's immutable part: everything but the frontmatter, `## Errata` and `## Review checks`.
+    """The part of an accepted record that changes only with the user's agreement: everything but the frontmatter,
+    `## Errata` and `## Review checks`.
 
     Review checks are how reviewers verify the decision or rule holds, so they may grow as reviews learn, unlike it.
     """
@@ -654,6 +699,11 @@ def record_refs(records, kind, tasks, specs):
     return refs
 
 
+def task_specs(meta):
+    """The specs a task links, whole (`spec:`) or through their summary (`uses:`)."""
+    return (meta.get("spec") or []) + [s for s in meta.get("uses") or [] if s not in (meta.get("spec") or [])]
+
+
 def linked_records(meta):
     """The ADRs and business rules a task, spec, question or idea links."""
     return [name for kind in KINDS for name in meta.get(kind.link) or []]
@@ -662,7 +712,8 @@ def linked_records(meta):
 def in_force(records, names):
     """The records `names` link to, each followed by the ones that changed it since: its amendments, recursively,
     or, once it is superseded, only its successors, which state what holds. A decision is read with every change to
-    it, or a worker follows one that no longer holds.
+    it, or a worker follows one that no longer holds. A retired record has none, and an amendment the record
+    restated (superseded by it) is left out: the record already says it.
 
     Yields (name, via) in reading order: via is None for a name in `names` (unknown ones included, not followed),
     else (relation, the record it relates to). A record linked in `names` is read at its own place, never as a follower."""
@@ -674,12 +725,12 @@ def in_force(records, names):
         seen.add(name)
         yield name, via
         r = records.get(name)
-        if r is None:
+        if r is None or r.meta.get("status") == "retired":
             return
         superseded = r.meta.get("status") == "superseded" and r.meta.get("superseded-by")
         key, relation = ("superseded-by", "supersedes") if superseded else ("amended-by", "amends")
         for x in r.meta.get(key) or []:
-            if x in records and x not in names:
+            if x in records and x not in names and not (key == "amended-by" and name in (records[x].meta.get("superseded-by") or [])):
                 yield from visit(x, (relation, name))
 
     for name in names:
@@ -688,9 +739,9 @@ def in_force(records, names):
 
 def consolidation_candidates(adrs, tasks):
     """Accepted ADRs that live amendments change, directly or through each other, most amended first:
-    (name, own, shared, live tasks linking any of them). Own amendments change only this ADR, so consolidating it
+    (name, own, shared, live tasks linking any of them). Own amendments change only this ADR, so restating it in place
     supersedes them; shared ones also change others and stay in force for them (maintenance.md).
-    Superseded records are left out: a consolidation already took them in. So are legacy ones, which have no
+    Superseded records are left out: a restated record already took them in. So are legacy ones, which have no
     frontmatter to record a successor in."""
     live = {n: r for n, r in adrs.items() if r.meta.get("status") in LIVE_STATUSES and not r.legacy}
     parents = {n: [p for p in r.meta.get("amends") or [] if p in live] for n, r in live.items()}
@@ -724,6 +775,17 @@ def stale_question(q, tasks):
     linked = (q.meta.get("tasks") or []) + (q.meta.get("blocks") or [])
     return (q.state == "open" and bool(linked) and not deferred(q, tasks)
             and all(tasks.get(s, Task(None, None, None, {})).state == "done" for s in linked))
+
+
+def retired_as(meta):
+    into = meta.get("into") or []
+    return f"a detail, now described in {'spec' if len(into) == 1 else 'specs'} {', '.join(into)}" if into else "no longer in force"
+
+
+def warn_amended(records, old, amended_by):
+    live = [x for x in amended_by if x not in records or records[x].meta.get("status") in LIVE_STATUSES]
+    print(f"warning: {old} now has {len(live)} amendments: a decision split over several records is read with all of them; "
+          f"when this change refines {old}, restate {old} in place instead (planning.md, \"Changing a record\")", file=sys.stderr)
 
 
 def require_records(proj, args):
@@ -981,7 +1043,7 @@ def format_section(path):
         f"filling in its Idea and Context sections so it stands alone; planning sessions pick it up from there. "
         f"Code whose shape follows from an ADR or a business rule cites it in a comment (`adr: <name>`, `rule: <name>`).\n\n"
         f"`{path}/goal.md` and `{path}/principles.md`, when present, say what the project is for and the rules every change must respect: read them before planning or reviewing, and treat them as the context every task belongs to. "
-        f"`sdd checks --task <slug>` prints the project-specific review checks for a task's areas.\n"
+        f"`sdd checks --task <slug>` prints the project-specific review checks of the records and specs a task links.\n"
         f"{SECTION_FOOTER}\n"
     )
 
@@ -1085,7 +1147,7 @@ def cmd_new(args):
         if p not in tasks:
             raise Error(f"unknown prerequisite: {p}")
     specs = proj.specs()
-    for s in args.spec:
+    for s in [*args.spec, *args.uses]:
         if s not in specs:
             raise Error(f"unknown spec: {s}")
     state = "tech-debt" if args.tech_debt else "todo"
@@ -1095,6 +1157,8 @@ def cmd_new(args):
         f.write(TASK_TEMPLATE.format(title=args.title, after=", ".join(args.after), **link_fields(args)))
     if args.spec:
         set_meta(path, "spec", args.spec)
+    if args.uses:
+        set_meta(path, "uses", args.uses)
     if args.needs:
         set_meta(path, "needs", args.needs)
     print(path)
@@ -1127,14 +1191,18 @@ def cmd_record(args):
     for key, back in (("supersedes", "superseded-by"), ("amends", "amended-by")):
         for old in getattr(args, key):
             current = records[old].meta.get(back) or []
-            set_meta(records[old].path, back, current + [name] if name not in current else current)
+            updated = current + [name] if name not in current else current
+            set_meta(records[old].path, back, updated)
             if key == "supersedes" and records[old].meta.get("status") != "superseded":
                 set_meta(records[old].path, "status", "superseded")
+            if key == "amends":
+                warn_amended(records, old, updated)
     print(path)
 
 
 def cmd_accept(args):
-    """Marks proposed ADRs and business rules accepted once the plan is agreed; from then on `validate` guards their body."""
+    """Marks proposed ADRs and business rules accepted once the plan is agreed; from then on `validate` flags changes to
+    their body, which the user agrees to."""
     proj = find_project(args.dir)
     records = proj.all_records()
     for name in args.names:
@@ -1147,6 +1215,55 @@ def cmd_accept(args):
             raise Error(f"{name} is {a.meta.get('status')}, not proposed")
         set_meta(a.path, "status", "accepted")
         print(f"accepted {name}")
+
+
+def cmd_retire(args):
+    """Takes ADRs and business rules that recorded a detail, not a decision, out of force; the record stays as history
+    and points at the specs that describe the detail now. With `--delete`, one that adds nothing is removed instead,
+    and unlinked from what is still live."""
+    proj = find_project(args.dir)
+    records, specs = proj.all_records(), proj.specs()
+    for x in args.into:
+        if x not in specs:
+            raise Error(f"unknown spec: {x}")
+    for name in args.names:
+        a = records.get(name)
+        if not a:
+            raise Error(f"unknown architecture decision or business rule: {name}")
+        if args.delete:
+            continue
+        if a.legacy:
+            raise Error(f"{a.path} has no frontmatter to record the status in")
+        if a.meta.get("status") not in LIVE_STATUSES:
+            raise Error(f"{name} is {a.meta.get('status')}, not in force")
+    if args.delete:
+        return delete_records(proj, records, set(args.names))
+    for name in args.names:
+        set_meta(records[name].path, "status", "retired")
+        if args.into:
+            set_meta(records[name].path, "into", args.into)
+        print(f"retired {name}")
+
+
+def delete_records(proj, records, names):
+    """Deletes the records `names` and their links from live tasks, specs, open questions and ideas and from the other
+    records. Done tasks, answered questions and closed ideas keep the names as history."""
+    live = [t for t in proj.tasks().values() if t.state != "done"] + list(proj.specs().values())
+    live += [x for x in [*proj.questions().values(), *proj.ideas().values()] if x.state == "open"]
+    links = [(item, (ADR.link, RULE.link)) for item in live]
+    links += [(r, ("supersedes", "amends", "superseded-by", "amended-by")) for n, r in records.items() if n not in names and not r.legacy]
+    for item, keys in links:
+        removed = []
+        for key in keys:
+            current = item.meta.get(key) or []
+            if names & set(current):
+                set_meta(item.path, key, [x for x in current if x not in names])
+                removed += [x for x in current if x in names and x not in removed]
+        if removed:
+            print(f"unlinked {', '.join(removed)} from {item.path}")
+    for name in sorted(names):
+        os.remove(records[name].path)
+        print(f"deleted {records[name].path}")
 
 
 def cmd_records(args):
@@ -1299,7 +1416,7 @@ def cmd_context(args):
     relevant = set(foundations if not matched else []) | set(matched) | set(matched_rules)
     print("tasks referencing the matching ADRs, business rules or specs:")
     for slug, t in sorted(tasks.items(), key=lambda kv: (kv[1].state != "done", kv[0])):
-        if relevant & set(linked_records(t.meta)) or set(matched_specs) & set(t.meta.get("spec") or []):
+        if relevant & set(linked_records(t.meta)) or set(matched_specs) & set(task_specs(t.meta)):
             print(f"  {slug}\t{t.state}\t{t.meta.get('title', '')}")
     print("questions on them (answered ones may carry requirements):")
     for slug, q in sorted(questions.items(), key=lambda kv: (kv[1].state != "open", kv[0])):
@@ -1312,28 +1429,25 @@ def cmd_context(args):
 
 
 def cmd_checks(args):
-    """Project-specific review checks: the `## Review checks` of ADRs, business rules and specs in the given areas or linked to a task."""
-    print_checks(find_project(args.dir), args.area, args.task)
+    """Project-specific review checks: the `## Review checks` of ADRs, business rules and specs in the given areas, or of
+    those a task's brief reads (plus the given areas, if any)."""
+    print_checks(Loaded(find_project(args.dir)), args.area, args.task)
 
 
-def print_checks(proj, wanted_areas, task):
-    records, specs = proj.all_records(), proj.specs()
+def print_checks(data, wanted_areas, task):
+    records, specs = data.records, data.specs
     areas, linked = list(wanted_areas), set()
     if task:
-        t = proj.get(task)
-        direct = set(linked_records(t.meta)) | set(t.meta.get("spec") or [])
-        for name in direct:
-            item = records.get(name) or specs.get(name)
-            if item:
-                areas += [a for a in item.meta.get("areas") or [] if a not in areas]
-        # The records that changed the linked ones bring their own checks, not their areas': a shared amendment's
-        # other areas aren't the task's.
-        linked = direct | {name for name, _ in in_force(records, linked_records(t.meta))}
+        t = data.proj.get(task, data.tasks)
+        # What the brief reads, not everything in its records' areas: a record's areas are far wider than one change,
+        # and most of their checks wouldn't apply. Not `uses:`: a task that only relies on a component isn't reviewed
+        # against it.
+        linked = {name for name, _ in in_force(records, linked_records(t.meta))} | set(t.meta.get("spec") or [])
     live = {n: a for n, a in records.items() if a.meta.get("status") in LIVE_STATUSES}
     for name, item in sorted(list(live.items()) + list(specs.items())):
         if (areas or task) and name not in linked and not area_matches(areas, item.meta.get("areas") or []):
             continue
-        bullets, _ = review_checks(item.path)
+        bullets = data.review_checks(item.path)
         if not bullets:
             continue
         print(f"{name}\t{','.join(item.meta.get('areas') or [])}\t{item.meta.get('title', '')}")
@@ -1348,14 +1462,14 @@ def add_links(path, meta, key, new):
 
 
 LINKS = {
-    "task": ("arch", "rule", "spec"),
+    "task": ("arch", "rule", "spec", "uses"),
     "question": ("task", "blocks", "arch", "rule"),
     "idea": ("task", "arch", "rule", "areas"),
     "spec": ("arch", "rule"),
     "adr": ("amends", "supersedes"),
     "rule": ("amends", "supersedes"),
 }
-LINK_KEYS = {"arch": ADR.link, "rule": RULE.link, "spec": "spec", "task": "tasks", "blocks": "blocks", "areas": "areas"}
+LINK_KEYS = {"arch": ADR.link, "rule": RULE.link, "spec": "spec", "uses": "uses", "task": "tasks", "blocks": "blocks", "areas": "areas"}
 
 
 def cmd_link(args):
@@ -1374,7 +1488,7 @@ def cmd_link(args):
         raise Error(f"{args.slug} is both a {' and a '.join(kinds)}; pass --as {'|'.join(kinds)}")
     kind = args.as_ or kinds[0]
     allowed = LINKS[kind]
-    given = [k for k in ("arch", "rule", "spec", "task", "blocks", "areas", "amends", "supersedes") if getattr(args, k)]
+    given = [k for k in ("arch", "rule", "spec", "uses", "task", "blocks", "areas", "amends", "supersedes") if getattr(args, k)]
     if not given:
         raise Error("nothing to link")
     for k in given:
@@ -1382,7 +1496,7 @@ def cmd_link(args):
             article = "an" if kind[0] in "aeiou" else "a"
             raise Error(f"--{k} doesn't apply to {article} {kind}; {article} {kind} takes {', '.join('--' + x for x in allowed)}")
     require_records(proj, args)
-    for x in args.spec:
+    for x in [*args.spec, *args.uses]:
         if x not in files["spec"]:
             raise Error(f"unknown spec: {x}")
     for x in [*args.task, *args.blocks]:
@@ -1405,11 +1519,13 @@ def cmd_link(args):
             if records[old].legacy:
                 raise Error(f"{records[old].path} has no frontmatter to record `{back}` in")
         add_links(item.path, item.meta, key, olds)
-        # Only frontmatter changes on either side: an accepted record's body stays history.
         for old in olds:
             add_links(records[old].path, records[old].meta, back, [args.slug])
             if key == "supersedes" and records[old].meta.get("status") != "superseded":
                 set_meta(records[old].path, "status", "superseded")
+            if key == "amends":
+                current = records[old].meta.get(back) or []
+                warn_amended(records, old, current + [args.slug] if args.slug not in current else current)
 
 
 def cmd_defer(args):
@@ -1441,8 +1557,7 @@ def cmd_spec(args):
     path = os.path.join(d, f"{args.slug}.md")
     with open(path, "w") as f:
         f.write(SPEC_TEMPLATE.format(title=args.title, areas=", ".join(args.areas), **link_fields(args)))
-        if args.feature:
-            f.write(FEATURE_SPEC_SECTIONS)
+        f.write(FEATURE_SPEC_SECTIONS if args.feature else COMPONENT_SPEC_SECTIONS)
     print(path)
 
 
@@ -1581,16 +1696,16 @@ def toward(proj, g, tasks, questions, ready, target):
 
 def cmd_show(args):
     proj = find_project(args.dir)
-    print_show(proj, args.slug, proj.tasks(), proj.questions())
+    print_show(Loaded(proj), args.slug)
 
 
 def linked_questions(questions, slug):
     return [(s, q) for s, q in sorted(questions.items()) if slug in (q.meta.get("tasks") or []) or slug in (q.meta.get("blocks") or [])]
 
 
-def print_show(proj, slug, tasks, questions):
-    g = Graph.from_tasks(tasks)
-    t = proj.get(slug, tasks)
+def print_show(data, slug):
+    tasks, questions, g = data.tasks, data.questions, data.graph
+    t = data.proj.get(slug, tasks)
     print(f"slug: {slug}\nstate: {t.state}\ntitle: {t.meta.get('title', '')}\nfile: {t.path}")
     if t.meta.get("claimed"):
         print(f"claimed: {t.meta['claimed']}")
@@ -1599,11 +1714,13 @@ def print_show(proj, slug, tasks, questions):
     state_of = lambda s: tasks[s].state if s in tasks else "missing"
     print("prereqs:" + "".join(f"\n  {p}\t{state_of(p)}" for p in g.prereqs(slug)))
     print("dependents:" + "".join(f"\n  {d}\t{state_of(d)}" for d in g.dependents(slug)))
+    records, specs = data.records, data.specs
     for kind in KINDS:
-        records = proj.records(kind)
-        print(f"{kind.link}:" + "".join(f"\n  {records[a].path if a in records else a + ' (missing)'}" for a in t.meta.get(kind.link) or []))
-    specs = proj.specs()
+        print(f"{kind.link}:" + "".join(f"\n  {records[a].path if a in records and records[a].kind is kind else a + ' (missing)'}"
+                                        for a in t.meta.get(kind.link) or []))
     print("specs:" + "".join(f"\n  {specs[s].path if s in specs else s + ' (missing)'}" for s in t.meta.get("spec") or []))
+    if t.meta.get("uses"):
+        print("uses:" + "".join(f"\n  {specs[s].path if s in specs else s + ' (missing)'}" for s in t.meta["uses"]))
     related = linked_questions(questions, slug)
     print("questions:" + "".join(f"\n  {s}\t{q.state}{' (blocks this task)' if slug in (q.meta.get('blocks') or []) else ''}\t{q.path}" for s, q in related))
     if t.state in STARTABLE:
@@ -1631,55 +1748,86 @@ def printed(fn, *args):
     return out.getvalue().rstrip()
 
 
-def cmd_brief(args):
-    """Prints a task and everything linked to it, review checks included so a worker keeps them from the start:
-    what `working.md` asks a worker to read, and with `--review` what `reviewing.md` asks a reviewer to read, in
-    one output instead of a dozen reads. A table of contents with sizes comes first, each linked ADR or rule is
-    followed by the records that changed it since, ADRs and answered questions are cut to what binds the work
-    unless `--full`, and a brief too long for a tool to print in full goes to a file."""
-    proj = find_project(args.dir)
-    tasks, questions, specs, records = proj.tasks(), proj.questions(), proj.specs(), proj.all_records()
-    t = proj.get(args.slug, tasks)
-    parts = [("status (sdd show)", printed(print_show, proj, args.slug, tasks, questions))]
-    # (label, path or missing name, what to drop unless --full, successors): a superseded record is only a pointer.
-    files = [("task", t.path, (), None)]
+def spec_summary(text):
+    """A spec's `## Summary` section, or without one the text between its frontmatter and its first section."""
+    m = FRONTMATTER_RE.match(text)
+    parts = re.split(r"^(?=## )", text[m.end():] if m else text, flags=re.M)
+    return next((p for p in parts[1:] if p.split("\n", 1)[0][3:].strip() == "Summary"), parts[0]).strip()
+
+
+def render(data, path, form, full):
+    """(text, title suffix, bytes) of a file as `sdd brief` prints it: whole, without the `form` sections, or with
+    `form` "summary" as a spec's summary. Rendered once per form for all the briefs built from `data`."""
+    key = (path, form, full)
+    if key not in data.rendered:
+        with open(path) as f:
+            text, suffix = f.read().rstrip(), ""
+        if form == "summary" and not full:
+            text, suffix = spec_summary(text), " (summary only: --full)"
+        elif form and form != "summary" and not full:
+            text, omitted = summary(text, form)
+            text = text.rstrip()
+            suffix = f" (without {', '.join(omitted)}: --full)" if omitted else ""
+        data.rendered[key] = (text, suffix, len(text.encode()))
+    return data.rendered[key]
+
+
+def brief_parts(data, slug, review=False, full=False):
+    """The parts of `sdd brief <slug>` as (title, text, bytes, doc): doc is (kind, name) for an ADR, rule or spec,
+    for `sdd cost`. Each linked ADR or rule is followed by the records that changed it since."""
+    proj, tasks, questions, specs, records = data.proj, data.tasks, data.questions, data.specs, data.records
+    t = proj.get(slug, tasks)
+    status = printed(print_show, data, slug)
+    parts = [("status (sdd show)", status, len(status.encode()), None)]
+    # (label, path or missing name, what to drop unless --full, (status, pointer), doc): a superseded or retired
+    # record is only a pointer.
+    files = [("task", t.path, (), None, None)]
     for name, via in in_force(records, linked_records(t.meta)):
         r = records.get(name)
         if r is None:
-            files.append((next(k.label for k in KINDS if name in (t.meta.get(k.link) or [])), name, (), None))
+            files.append((next(k.label for k in KINDS if name in (t.meta.get(k.link) or [])), name, (), None, None))
             continue
-        label = r.kind.label + (f", {via[0]} {via[1]}" if via else "")
+        label, doc = r.kind.label + (f", {via[0]} {via[1]}" if via else ""), (r.kind.name, name)
         successors = r.meta.get("superseded-by") or []
         if r.meta.get("status") == "superseded" and successors:
-            files.append((label, r.path, (), successors))
+            files.append((label, r.path, (), ("superseded", f"Superseded by {', '.join(successors)}: read that instead."), doc))
+        elif r.meta.get("status") == "retired":
+            files.append((label, r.path, (), ("retired", f"Retired: {retired_as(r.meta)}."), doc))
         else:
-            files.append((label, r.path, ADR_FULL_ONLY if r.kind is ADR else (), None))
-    files += [("spec", specs[x].path if x in specs else x, (), None) for x in t.meta.get("spec") or []]
-    files += [(f"question ({q.state})", q.path, ANSWERED_FULL_ONLY if q.state == "answered" else (), None)
-              for _, q in linked_questions(questions, args.slug)]
-    if args.review:
-        files += [(name, doc_path(proj, name), (), None) for name in PROJECT_DOCS if os.path.isfile(doc_path(proj, name))]
-        files += [("dependent task", tasks[d].path, (), None) for d in Graph.from_tasks(tasks).dependents(args.slug)]
-    for kind, path, drop, successors in files:
+            files.append((label, r.path, ADR_FULL_ONLY if r.kind is ADR else (), None, doc))
+    whole = t.meta.get("spec") or []
+    for x in task_specs(t.meta):
+        files.append(("spec" if x in whole else "spec (uses)", specs[x].path if x in specs else x, () if x in whole else "summary", None,
+                      ("spec", x) if x in specs else None))
+    files += [(f"question ({q.state})", q.path, ANSWERED_FULL_ONLY if q.state == "answered" else (), None, None)
+              for _, q in linked_questions(questions, slug)]
+    if review:
+        files += [(name, doc_path(proj, name), (), None, None) for name in PROJECT_DOCS if os.path.isfile(doc_path(proj, name))]
+        files += [("dependent task", tasks[d].path, (), None, None) for d in data.graph.dependents(slug)]
+    for kind, path, form, pointer, doc in files:
         if not os.path.isabs(path):
-            parts.append((f"{kind}: {path} (missing)", ""))
+            parts.append((f"{kind}: {path} (missing)", "", 0, None))
             continue
         title = f"{kind}: {os.path.relpath(path, proj.root)}"
-        if successors:
-            parts.append((f"{title} (superseded)", f"Superseded by {', '.join(successors)}: read that instead."))
+        if pointer:
+            parts.append((f"{title} ({pointer[0]})", pointer[1], len(pointer[1].encode()), doc))
             continue
-        with open(path) as f:
-            text = f.read().rstrip()
-        if drop and not args.full:
-            text, omitted = summary(text, drop)
-            text = text.rstrip()
-            if omitted:
-                title += f" (without {', '.join(omitted)}: --full)"
-        parts.append((title, text))
-    parts.append(("review checks (sdd checks --task)", printed(print_checks, proj, [], args.slug)))
+        text, suffix, size = render(data, path, form, full)
+        parts.append((title + suffix, text, size, doc))
+    checks = printed(print_checks, data, [], slug)
+    parts.append(("review checks (sdd checks --task)", checks, len(checks.encode()), None))
+    return parts
 
-    toc = "contents (bytes):\n" + "".join(f"  {len(text.encode()):>6}  {title}\n" for title, text in parts)
-    brief = toc + "".join(f"\n=== {title}\n\n{text}\n" for title, text in parts)
+
+def cmd_brief(args):
+    """Prints a task and everything linked to it, review checks included so a worker keeps them from the start:
+    what `working.md` asks a worker to read, and with `--review` what `reviewing.md` asks a reviewer to read, in
+    one output instead of a dozen reads. A table of contents with sizes comes first, ADRs, specs the task only uses
+    and answered questions are cut to what binds the work unless `--full`, and a brief too long for a tool to print
+    in full goes to a file."""
+    parts = brief_parts(Loaded(find_project(args.dir)), args.slug, args.review, args.full)
+    toc = "contents (bytes):\n" + "".join(f"  {size:>6}  {title}\n" for title, _, size, _ in parts)
+    brief = toc + "".join(f"\n=== {title}\n\n{text}\n" for title, text, _, _ in parts)
     if len(brief) <= BRIEF_MAX:
         print(brief, end="")
         return
@@ -1687,6 +1835,42 @@ def cmd_brief(args):
     with os.fdopen(fd, "w") as f:
         f.write(brief)
     print(f"{toc}\nThe brief is {len(brief.encode())} bytes, too long to print in full: read it from {path}")
+
+
+def brief_costs(data):
+    """The brief size of each live task, and the bytes each ADR, rule and spec adds to each brief that loads it:
+    ({slug: bytes}, {(kind, name): [bytes per task]})."""
+    sizes, docs = {}, {}
+    for slug, t in data.tasks.items():
+        if t.state == "done":
+            continue
+        parts = brief_parts(data, slug)
+        sizes[slug] = sum(size for _, _, size, _ in parts)
+        for _, _, size, doc in parts:
+            if doc:
+                docs.setdefault(doc, []).append(size)
+    return sizes, docs
+
+
+def cmd_cost(args):
+    """What the docs cost to read: each ADR, rule and spec by the bytes it adds to the live tasks' briefs, summed
+    over the tasks that load it, after a line on how long those briefs are."""
+    data = Loaded(find_project(args.dir))
+    sizes, docs = brief_costs(data)
+    if not sizes:
+        print("0 live tasks")
+        return
+    values = sorted(sizes.values())
+    largest = max(sizes, key=lambda s: (sizes[s], s))
+    print(f"{len(sizes)} live tasks, brief bytes: median {int(statistics.median(values))}, "
+          f"90th percentile {values[-(-9 * len(values) // 10) - 1]}, largest {sizes[largest]} ({largest})")
+    rows = []
+    for (kind, name), loads in docs.items():
+        item = data.specs[name] if kind == "spec" else data.records[name]
+        if not args.area or area_matches(args.area, item.meta.get("areas") or []):
+            rows.append((sum(loads), max(loads), len(loads), kind, name))
+    for row in sorted(rows, key=lambda r: (-r[0], r[4]))[:args.top]:
+        print("\t".join(map(str, row)))
 
 
 def cmd_ask(args):
@@ -1897,7 +2081,7 @@ def accumulations(proj, tasks, questions, records, specs):
     adrs = {n: r for n, r in records.items() if r.kind is ADR}
     for name, own, shared, linked in consolidation_candidates(adrs, tasks):
         if len(own) + len(shared) > AMENDMENTS_MAX:
-            out.append(f"{name} has {len(own) + len(shared)} amendments, linked by {linked} live tasks: consolidate it "
+            out.append(f"{name} has {len(own) + len(shared)} amendments, linked by {linked} live tasks: restate it in one record "
                        "(maintenance.md; `sdd adrs --amended`)")
     stale = sum(1 for q in questions.values() if stale_question(q, tasks))
     if stale:
@@ -1985,17 +2169,27 @@ def cmd_validate(args):
                 for ref in a.meta.get(key) or []:
                     if ref not in of_kind:
                         errors.append(f"{a.path}: unknown {kind.label} {ref} in {key}")
+            if status == "retired":
+                for x in a.meta.get("into") or []:
+                    if x not in specs:
+                        warnings.append(f"{a.path}: retired into spec {x}, which no longer exists; point `into:` at the spec that describes the detail now")
             with open(a.path) as f:
                 text = f.read()
             body = sections(a.path)
             if kind is ADR:
-                # Once accepted the body is history and can't be shortened, so the warning would never go away.
+                # Once accepted the body changes only with the user's agreement, so the warning would stay on every long
+                # record already agreed. The same goes for an Intent, which older records don't have.
                 if status == "proposed" and len(text.splitlines()) > ADR_MAX_LINES:
                     warnings.append(f"{a.path}: over {ADR_MAX_LINES} lines; an ADR records a decision, a description of how things are belongs in a spec (`sdd spec`)")
+                if status == "proposed" and not body.get("Intent"):
+                    warnings.append(f"{a.path}: empty or missing `## Intent`; say in a line or two what the decision is for, so a case it doesn't cover is settled from it")
                 if status != "proposed" and not body.get("Alternatives considered"):
                     warnings.append(f"{a.path}: no alternatives considered; a decision with no alternatives reads as a spec, or wasn't one")
-            elif not body.get("Rule"):
-                (warnings if status == "proposed" else errors).append(f"{a.path}: empty `## Rule` section; the rule is what later changes must keep")
+            else:
+                if not body.get("Rule"):
+                    (warnings if status == "proposed" else errors).append(f"{a.path}: empty `## Rule` section; the rule is what later changes must keep")
+                if status == "proposed" and not body.get("Questions it answers"):
+                    warnings.append(f"{a.path}: empty or missing `## Questions it answers`; a rule earns its place by the cases it settles without asking anyone")
             warnings += check_review_checks(a.path)
             if base_ref and status != "proposed":
                 rel = os.path.relpath(a.path, data_repo)
@@ -2003,14 +2197,16 @@ def cmd_validate(args):
                 if r.returncode == 0:
                     old_meta = parse_frontmatter(r.stdout)
                     if old_meta is not None and old_meta.get("status") != "proposed" and frozen_wording(r.stdout) != frozen_wording(text):
-                        errors.append(f"{a.path}: body changed since {base_ref}; an accepted {kind.label} only takes frontmatter, `## Errata` and `## Review checks` edits and link targets, a change is a new one that amends or supersedes it")
+                        warnings.append(f"{a.path}: body changed since {base_ref}; changing an accepted {kind.label} is the user's call, so they agree to it before it merges")
 
-    def check_records(path, meta):
+    def check_records(path, meta, history=False):
+        # A record deleted with `sdd retire --delete` is unlinked from live files only: history keeps its name.
         for kind in KINDS:
             for a in meta.get(kind.link) or []:
-                if a not in records or records[a].kind is not kind:
+                if (a not in records and not history) or (a in records and records[a].kind is not kind):
                     errors.append(f"{path}: unknown {kind.label} {a}")
 
+    used = {x for t in tasks.values() if t.state != "done" for x in t.meta.get("uses") or []}
     for name, s in specs.items():
         if not SLUG_RE.match(name):
             errors.append(f"invalid spec slug: {s.path}")
@@ -2020,14 +2216,24 @@ def cmd_validate(args):
             warnings.append(f"{s.path}: no areas, so `sdd context` can't find it by area")
         check_records(s.path, s.meta)
         body = sections(s.path)
+        linking = [t for t in tasks.values() if name in task_specs(t.meta)]
+        if name in used and not body.get("Summary"):
+            warnings.append(f"{s.path}: live tasks use it (`uses:`) but it has no `## Summary`, which is all `sdd brief` prints for them; "
+                            "say in a few lines what the component is for and what others may rely on")
+        if len(body.get("Summary", "").splitlines()) > SUMMARY_MAX_LINES:
+            warnings.append(f"{s.path}: `## Summary` over {SUMMARY_MAX_LINES} lines; it is what tasks that only use the component read")
+        if ("Goal" in body or "How it works" in body) and linking and all(t.state == "done" for t in linking):
+            warnings.append(f"{s.path}: a feature spec whose tasks are all done; move what lasts to component specs, ADRs and rules, "
+                            "then delete it (maintenance.md)")
         for name in ("Goal", "How it works"):
             if name in body and not body[name]:
                 warnings.append(f"{s.path}: empty `## {name}` section; a feature spec is what workers settle open details from")
         warnings += check_review_checks(s.path)
     for slug, t in sorted(tasks.items()):
-        check_records(t.path, t.meta)
-        for s in t.meta.get("spec") or []:
-            if s not in specs:
+        check_records(t.path, t.meta, t.state == "done")
+        for s in task_specs(t.meta):
+            # A feature spec is deleted once its last task is done: done tasks keep naming it as history.
+            if s not in specs and t.state != "done":
                 errors.append(f"{t.path}: unknown spec {s}")
         if t.state in ("in-progress", "done"):
             blockers = [p for p in unmet(g, slug, tasks) if p in tasks]
@@ -2059,7 +2265,7 @@ def cmd_validate(args):
             for s in meta.get(key) or []:
                 if s not in tasks:
                     errors.append(f"{path}: unknown task {s} in {key}")
-        check_records(path, meta)
+        check_records(path, meta, state == "answered")
         if not meta.get("title"):
             errors.append(f"{path}: missing title")
         if not (meta.get("tasks") or linked_records(meta)):
@@ -2096,13 +2302,22 @@ def cmd_validate(args):
             for s in meta.get(key) or []:
                 if s not in tasks:
                     errors.append(f"{path}: unknown task {s} in {key}")
-        check_records(path, meta)
+        check_records(path, meta, state == "closed")
         for x in meta.get("into") or []:
-            if x not in tasks and x not in records and x not in specs:
+            # `close-idea` checked each name existed, and a feature spec is deleted once its tasks are done: a closed
+            # idea's `into` is history. A deleted spec can't be told from other names that are gone, so none are errors.
+            if x not in tasks and x not in records and x not in specs and state != "closed":
                 errors.append(f"{path}: unknown task, architecture decision, business rule or spec {x} in into")
         if state == "open" and not meta.get("areas"):
             warnings.append(f"{path}: no areas, so `sdd context` won't show it when planning in its areas")
     warnings += accumulations(proj, tasks, questions, records, specs)
+    try:
+        sizes, _ = brief_costs(Loaded(proj))
+    except Error:
+        sizes = {}  # what stops the briefs from loading is reported above
+    if sizes and statistics.median(sizes.values()) > BRIEF_MAX / 2:
+        warnings.append(f"the median brief of the {len(sizes)} live tasks is {int(statistics.median(sizes.values()))} bytes, over half of "
+                        f"the {BRIEF_MAX} a tool prints in full: `sdd cost` shows the docs that cost the most to read (maintenance.md)")
     if proj.mode == "shared" and not args.dir:
         # Code cites records by name, so a renamed one or one that changed leaves comments pointing at the past.
         # Warnings, not errors: code written before the workflow may cite informally.
@@ -2114,6 +2329,8 @@ def cmd_validate(args):
                 warnings.append(f"{where}: cites {prefix}: {name}, which is a {r.kind.label}; cite it as `{r.kind.cite}: {name}`")
             elif r.meta.get("status") == "superseded":
                 warnings.append(f"{where}: cites {prefix}: {name}, superseded by {', '.join(r.meta.get('superseded-by') or [])}")
+            elif r.meta.get("status") == "retired":
+                warnings.append(f"{where}: cites {prefix}: {name}, retired: {retired_as(r.meta)}")
         # The section in the agent file is a copy of this CLI's template, so repos fall behind upgrades.
         repo = toplevel()
         marker, marker_file = read_marker(repo)
@@ -2308,7 +2525,7 @@ def cmd_done(args):
     print(open_pr(proj, f"done/{args.slug}", f"Finish task {args.slug}", body, finish, not args.no_pr))
 
 
-READ_ONLY = (cmd_ready, cmd_show, cmd_brief, cmd_list, cmd_context, cmd_checks, cmd_records, cmd_areas,
+READ_ONLY = (cmd_ready, cmd_show, cmd_brief, cmd_cost, cmd_list, cmd_context, cmd_checks, cmd_records, cmd_areas,
              cmd_questions, cmd_blockers, cmd_ideas, cmd_validate, cmd_render, cmd_doc)
 
 
@@ -2357,6 +2574,7 @@ def main():
     s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR", help="architecture decisions (file name without .md)")
     s.add_argument("--rule", nargs="+", action="extend", default=[], metavar="RULE", help="business rules it must respect (file name without .md)")
     s.add_argument("--spec", nargs="+", action="extend", default=[], metavar="SPEC", help="specs it implements or changes")
+    s.add_argument("--uses", nargs="+", action="extend", default=[], metavar="SPEC", help="specs of components it relies on without changing them: `sdd brief` prints only their summary")
     s.add_argument("--needs", nargs="+", action="extend", default=[], metavar="WHAT", help="what an agent can't provide on its own (e.g. user, secret); `sdd ready` shows it and orchestrated runs skip the task")
     s.set_defaults(fn=cmd_new)
 
@@ -2367,22 +2585,31 @@ def main():
         s.add_argument("--title", required=True)
         s.add_argument("--areas", nargs="+", action="extend", default=[], metavar="AREA", help="areas it belongs to, generic to specific with slashes (e.g. backend/auth)")
         s.add_argument("--supersedes", nargs="+", action="extend", default=[], metavar=kind.name.upper(), help=f"{what} it replaces entirely; they get `superseded-by` and status superseded")
-        s.add_argument("--amends", nargs="+", action="extend", default=[], metavar=kind.name.upper(), help=f"{what} it changes in part; they get `amended-by` and otherwise stand")
+        s.add_argument("--amends", nargs="+", action="extend", default=[], metavar=kind.name.upper(), help=f"{what} it changes in part; they get `amended-by` and otherwise stand. Discouraged: restate the old one in place instead")
         s.set_defaults(fn=cmd_record, kind=kind)
 
     s = sub.add_parser("accept", help="mark proposed architecture decisions or business rules accepted (the plan is agreed)")
     s.add_argument("names", nargs="+", metavar="NAME", help="file names without .md")
     s.set_defaults(fn=cmd_accept)
 
+    s = sub.add_parser("retire", help="retire architecture decisions or business rules that recorded a detail, not a decision: they leave force and point at the specs that describe it; "
+                       "--delete removes an outdated one that adds nothing")
+    s.add_argument("names", nargs="+", metavar="NAME", help="file names without .md")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--into", nargs="+", action="extend", default=[], metavar="SPEC", help="the specs that now describe the detail")
+    g.add_argument("--delete", action="store_true", help="delete the files, in any status, and unlink them from live tasks, specs, open questions and ideas "
+                   "and from other records; done tasks, answered questions and closed ideas keep the names as history")
+    s.set_defaults(fn=cmd_retire)
+
     s = sub.add_parser("adrs", help="list architecture decisions by how many tasks and specs reference them: name, status, refs, areas, title")
     s.add_argument("--area", nargs="+", action="extend", metavar="AREA", help="only ADRs in these areas (prefix match)")
-    s.add_argument("--amended", action="store_true", help="the accepted ADRs to consolidate, most amended first: name, amendments, live tasks linking them, "
-                   "its own amendments (consolidating supersedes them), the shared ones (they also amend other ADRs and stay in force)")
+    s.add_argument("--amended", action="store_true", help="the accepted ADRs to restate in place, most amended first: name, amendments, live tasks linking them, "
+                   "its own amendments (the restated ADR supersedes them), the shared ones (they also amend other ADRs and stay in force)")
     s.set_defaults(fn=cmd_records, kind=ADR, all=True)
 
     s = sub.add_parser("rules", help="list the business rules in force (proposed or accepted) by how many tasks and specs reference them: name, status, refs, areas, title")
     s.add_argument("--area", nargs="+", action="extend", metavar="AREA", help="only rules in these areas (prefix match)")
-    s.add_argument("--all", action="store_true", help="include superseded and deprecated rules")
+    s.add_argument("--all", action="store_true", help="include superseded, retired and deprecated rules")
     s.set_defaults(fn=cmd_records, kind=RULE)
 
     s = sub.add_parser("spec", help="create a living spec in specs/: how something is, kept current by the PRs that change it")
@@ -2403,17 +2630,19 @@ def main():
     s.add_argument("--path", nargs="+", action="extend", default=[], metavar="PATH", help="code files or directories the feature touches: the ADRs and business rules their `adr:`/`rule:` comments cite")
     s.set_defaults(fn=cmd_context)
 
-    s = sub.add_parser("checks", help="review checks from the `## Review checks` of ADRs, business rules and specs: all, or those in some areas or around a task")
-    s.add_argument("--area", nargs="+", action="extend", default=[], metavar="AREA", help="areas the change touches (prefix match)")
-    s.add_argument("--task", metavar="SLUG", help="a task: the checks of its ADRs, business rules and specs, and of everything in their areas")
+    s = sub.add_parser("checks", help="review checks from the `## Review checks` of ADRs, business rules and specs: all, or those in some areas or of a task")
+    s.add_argument("--area", nargs="+", action="extend", default=[], metavar="AREA", help="areas the change touches (prefix match); with --task, added to the task's checks")
+    s.add_argument("--task", metavar="SLUG", help="a task: the checks of the ADRs, business rules and specs its brief reads (`arch:`, `rules:` and `spec:`, "
+                   "with the amendments and successors read with them), not of everything in their areas")
     s.set_defaults(fn=cmd_checks)
 
-    s = sub.add_parser("link", help="add links to a task (--arch, --rule, --spec), a question (--task, --blocks, --arch, --rule), an idea (--task, --arch, --rule, --areas), a spec (--arch, --rule), or an ADR or business rule (--amends, --supersedes) in any state, instead of editing frontmatter by hand")
+    s = sub.add_parser("link", help="add links to a task (--arch, --rule, --spec, --uses), a question (--task, --blocks, --arch, --rule), an idea (--task, --arch, --rule, --areas), a spec (--arch, --rule), or an ADR or business rule (--amends, --supersedes) in any state, instead of editing frontmatter by hand")
     s.add_argument("slug", help="a task, question, idea, spec, architecture decision or business rule")
     s.add_argument("--as", dest="as_", choices=list(LINKS), help="what the slug names, when several kinds share it")
     s.add_argument("--arch", nargs="+", action="extend", default=[], metavar="ADR")
     s.add_argument("--rule", nargs="+", action="extend", default=[], metavar="RULE")
     s.add_argument("--spec", nargs="+", action="extend", default=[], metavar="SPEC")
+    s.add_argument("--uses", nargs="+", action="extend", default=[], metavar="SPEC")
     s.add_argument("--task", nargs="+", action="extend", default=[], metavar="TASK")
     s.add_argument("--blocks", nargs="+", action="extend", default=[], metavar="TASK")
     s.add_argument("--areas", nargs="+", action="extend", default=[], metavar="AREA")
@@ -2446,9 +2675,15 @@ def main():
     s = sub.add_parser("brief", help="print a task with its ADRs and rules (each followed by its amendments and successors), specs, questions and review checks, after a table of contents; --review adds goal, principles and dependents; to a file when too long to print")
     s.add_argument("slug")
     s.add_argument("--review", action="store_true", help="what a reviewer reads: also the project docs and the dependents' task files")
-    s.add_argument("--full", action="store_true", help="print ADRs whole, not only their Decision: also " + ", ".join(ADR_FULL_ONLY)
-                   + "; and answered questions whole, not only their Answer")
+    s.add_argument("--full", action="store_true", help="print ADRs whole, not only their Intent and Decision: also " + ", ".join(ADR_FULL_ONLY)
+                   + "; the specs it uses whole, not only their summary; and answered questions whole, not only their Answer")
     s.set_defaults(fn=cmd_brief)
+
+    s = sub.add_parser("cost", help="what the docs cost to read: the live tasks' brief sizes, then each ADR, business rule and spec they load "
+                       "by its bytes times the tasks loading it: product, bytes, tasks, kind, name")
+    s.add_argument("--area", nargs="+", action="extend", default=[], metavar="AREA", help="only docs in these areas (prefix match)")
+    s.add_argument("--top", type=int, default=15, metavar="N", help="how many docs to list (default 15)")
+    s.set_defaults(fn=cmd_cost)
 
     s = sub.add_parser("doc", help="project docs (goal, principles): new writes the template, list shows their status, check fails on drafts")
     s.add_argument("action", choices=["new", "list", "check"])

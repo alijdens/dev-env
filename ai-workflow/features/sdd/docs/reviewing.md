@@ -11,7 +11,7 @@ When a check below is added or changed because something slipped through a revie
 1. Find the task: the PR's branch is named after its slug, and in shared mode the title carries it too. If neither matches a task, ask instead of guessing.
 2. `sdd brief <slug> --review`, on the PR's branch so what the PR added counts, prints in one go: the task's state, prerequisites and dependents; the task file, its ADRs and business rules, each followed by the records that changed it since, its specs and the questions linked to it; `goal.md` and `principles.md` when they exist; the dependents' task files (see "Dependents can build on it"); and the project's review checks (`sdd checks --task <slug>`). ADRs come without their Context, Alternatives considered and Consequences, and answered questions with only their Answer; add `--full` when judging a change needs the reasoning behind a decision. A table of contents with each part's size comes first; a brief too long to print in full goes to a file whose path it prints. Read it instead of opening those files one by one.
 3. Read the PR description and the full diff against the base branch.
-4. If the diff touches an area outside the task's ADRs, rules and specs (`sdd areas`), add its checks with `sdd checks --area <area>`. If it touches code that cites a business rule the task doesn't link (`sdd context --path <changed files>`), read that rule too: it holds whatever the task's areas.
+4. The brief carries the checks of what the task links. Add those of the areas the diff touches with `sdd checks --area <area>` (`sdd areas` lists them): a change can break a decision its task never linked. A check that applied and that the worker couldn't have known of is a planning finding (a missing link), not the implementer's. If it touches code that cites a business rule the task doesn't link (`sdd context --path <changed files>`), read that rule too: it holds whatever the task's areas.
 
 ## Checks
 
@@ -19,27 +19,28 @@ When a check below is added or changed because something slipped through a revie
 
 - Every acceptance criterion is met by the diff, not just claimed in the description.
 - The change follows the feature spec the task links. Its Shape may be adjusted in the PR, with the spec updated and the PR saying why; a change to How it works, a rule or a decision is the user's call: a finding, resolved by a question or a planning change on main.
+- A business rule is applied as far as what it is for, no further: a diff that audits, notifies, syncs or checks more than the rule's Why calls for (a row per read where the rule wants a record of the access) is a finding like one that ignores the rule, at the cost the rule names.
 - Every business rule the task links, and every one cited by the code the diff touches, still holds: a new path that reaches the same data without going through the place that enforces the rule, or that weakens its test, is a finding.
 - Every behavioral claim in the PR description, and every guarantee the task's Goal or an ADR states in words ("verified", "single-use", "never returned", "bounded"), is checked against the diff too: it maps to an observable artifact (a column, a flag, a response field, a code path with a test) or it is a finding. The criteria are the minimum, not the whole promise.
 - For each bound or limit the task, an ADR or the description claims (a max depth, a retry count, "queries bounded by ..."), find the test that exercises it at and past the boundary, and check what cached or memoized state the error path leaves behind: a bound that errors but keeps the work going isn't a bound.
 - A task far over the PR size target in `../pull-requests.md` is a planning finding (the task should have been split), not the implementer's: say so. A split the implementer made (`working.md`) is checked instead: the cut follows from the feature spec, rules or ADRs, the PR leaves main working and delivers its share whole, every moved criterion is in the new task word for word, the new task carries the same links, and every dependent that needs the moved part now waits on it. A cut that only the PR's convenience explains is a finding: where to split was the user's call.
 - Anything the diff does beyond the task's goal is flagged: unrelated refactors, extra features, drive-by fixes. Out-of-scope follow-ups belong in tech-debt tasks (`sdd new <slug> --tech-debt`), or in ideas (`sdd idea`) when they need designing first, not in the PR.
-- Implementation choices contradicting an ADR or a business rule are flagged. Changing one needs a new record, not a quiet deviation, and not a question that leaves the code as is.
+- Implementation choices contradicting an ADR or a business rule are flagged, judged by what the record is for: a case its Intent covers is fine even where its wording didn't foresee it, and the PR says so. One the intent doesn't cover needs the record changed by the user (`planning.md`, "Changing a record"), not a quiet deviation, an exception written into the code, or a question that leaves the code as is.
 - ADRs and business rules the diff's shape follows from are linked in the task's `arch:` and `rules:` (`sdd context --grep` on the diff's key terms, or `--path` on the files it touches, finds candidates). A missing link is a planning finding, fixed with `sdd link`.
-- The PR doesn't edit an accepted ADR's or rule's body (`sdd validate` fails on it); errata lines and new records with `--amends`/`--supersedes` are the only ways to change one. Specs the change affects are updated in the PR and listed in the task's `spec:`.
+- The PR doesn't change what an accepted ADR or rule says (`sdd validate` warns when an accepted record changed; fixing a slip is fine), and adds no amendment. A record it adds passes the test in `planning.md`, "Architecture decisions", and follows "Wording a record": a detail written up as a decision, a prohibition with a list of exceptions where a default would do, or a record full of file and function names is a finding. Specs the change affects are updated in the PR, at the level `overview.md` sets (no restating the code), and listed in the task's `spec:`.
 
 ### Serves the goal, respects the principles
 
 Only when `goal.md` and `principles.md` exist (`sdd doc list`); say which were absent otherwise.
 
 - The PR doesn't work against a non-goal or build toward something the goal excludes. A task that does is a planning finding, not the implementer's fault, but it is still flagged.
-- Every principle the diff touches is respected. Cite the principle's line for each violation; a change that needs an exception needs an ADR, not a reviewer's blessing. Principles about what data reaches whom (a model, a log, a client) apply to list and read endpoints too, not only to the operation that creates the data: a token or contact detail in every row of a listing is sent on every listing.
+- Every principle the diff touches is respected. Cite the principle's line for each violation; a change that needs an exception is the user's call, not a reviewer's blessing, and an exception that keeps coming back means the principle is stated at the wrong level: say so. Principles about what data reaches whom (a model, a log, a client) apply to list and read endpoints too, not only to the operation that creates the data: a token or contact detail in every row of a listing is sent on every listing.
 
 ### Project review checks
 
-Each bullet `sdd checks` printed is verified against the diff like an acceptance criterion, and reported by the ADR, business rule or spec it comes from. A check the diff can't meet because the decision or rule no longer fits is a finding, not a reason to skip it: the fix is a new record.
+Each bullet `sdd checks` printed is verified against the diff like an acceptance criterion, and reported by the ADR, business rule or spec it comes from. A check the diff can't meet because the decision or rule no longer fits is a finding, not a reason to skip it: the fix is changing the record (`planning.md`, "Changing a record").
 
-When something slipped through a review and a project-specific check would have caught it, add the bullet to the `## Review checks` of the ADR, business rule or spec it belongs to (an accepted record takes that edit), the way `lessons.md` does for these generic checks. A check that doesn't fit any record or spec's areas is a sign the rule is a principle, or the thing needs a spec.
+When something slipped through a review and a project-specific check would have caught it, add the bullet to the `## Review checks` of the ADR, business rule or spec it belongs to, the way `lessons.md` does for these generic checks; when a test or a lint can enforce it, that is a tech-debt task instead of a check. A check that doesn't fit any record or spec's areas is a sign the rule is a principle, or the thing needs a spec.
 
 ### No unplanned breaking changes
 
@@ -101,7 +102,7 @@ A task left in the wrong state blocks the workflow: a task stuck in `in-progress
 
 - Every question the PR adds can be answered by someone who wasn't in the conversation: the Context says where it came up, why it matters, and what was assumed meanwhile. "See discussion" or a bare option list is a finding.
 - Choices the PR made that neither the task, an ADR nor an answered question settles are flagged as unrecorded assumptions; the fix is to record them with `sdd ask`, not to ask in the review. When an ADR names a reference system or semantics (OpenFGA, OAuth, a standard), being stricter or looser than it is such a choice.
-- A question marked answered whose answer changes a decision has a new ADR linked from its Answer.
+- A question marked answered whose answer changes a decision or a rule links the record it changed from its Answer.
 - Nothing in the PR is blocked by an open question (`sdd show <slug>` on the branch): if the implementation went ahead anyway, say whether the assumption it took is cheap to reverse.
 
 ### Tests test the feature
