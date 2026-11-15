@@ -67,6 +67,8 @@ ADR_FULL_ONLY = ("Context", "Alternatives considered", "Consequences")
 ANSWERED_FULL_ONLY = ("Question", "Context")
 # Inline markdown links; a target with a scheme, an anchor or an absolute path isn't a file next to the record.
 LINK_RE = re.compile(r"(\]\()([^)\s]+)")
+# What closes an inline link after its target: `)`, optionally after a title.
+LINK_END_RE = re.compile(r"""(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?[ \t]*\)""")
 NOT_RELATIVE_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*:|#|/)")
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
 CODE_SPAN_RE = re.compile(r"(`+)[^\n]*?\1")
@@ -616,10 +618,19 @@ def without_code(text):
     return CODE_SPAN_RE.sub(blank, FENCE_RE.sub(blank, text))
 
 
-def relative_links(text):
-    """The matches of each relative inline link outside code; group 2 is its target."""
-    outside = {m.start() for m in LINK_RE.finditer(without_code(text))}
-    return [m for m in LINK_RE.finditer(text) if m.start() in outside and not NOT_RELATIVE_RE.match(m.group(2))]
+def escaped(text, i):
+    """Whether the character at `i` is escaped by an odd run of backslashes before it."""
+    n = i
+    while n and text[n - 1] == "\\":
+        n -= 1
+    return (i - n) % 2 == 1
+
+
+def relative_links(text, plain=None):
+    """The matches of each relative inline link outside code (`plain`: `text` with code blanked, if at hand); group 2 is
+    its target. An escaped `\\]` is text, not the end of a label."""
+    outside = {m.start() for m in LINK_RE.finditer(without_code(text) if plain is None else plain)}
+    return [m for m in LINK_RE.finditer(text) if m.start() in outside and not escaped(text, m.start()) and not NOT_RELATIVE_RE.match(m.group(2))]
 
 
 def link_targets(text):
@@ -635,6 +646,44 @@ def retarget(text, fn):
         out += [text[last:m.start(2)], fn(m.group(2))]
         last = m.end(2)
     return "".join(out) + text[last:]
+
+
+def label_start(text):
+    """Where the `[` opening the link label that `text` ends in is, or None: brackets nest, and a label never spans a
+    blank line."""
+    depth = 0
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] == "\n" and not text[text.rfind("\n", 0, i) + 1:i].strip():
+            return None
+        if escaped(text, i):
+            continue
+        if text[i] == "[" and not depth:
+            return i
+        depth += {"]": 1, "[": -1}.get(text[i], 0)
+    return None
+
+
+def drop_links(text, drop):
+    """`text` with each relative inline link outside code whose target `drop(target)` accepts replaced by its text, and
+    the targets it dropped. A link inside a dropped one's label is dropped first, so nested ones leave only text."""
+    plain = without_code(text)
+    out, out_plain, last, dropped = "", "", 0, []
+    for m in relative_links(text, plain):
+        close = LINK_END_RE.match(text, m.end(2))
+        if m.start() < last or not close or not drop(m.group(2)):
+            continue
+        # Searched in what was already rewritten, so an outer link finds the label an inner one left.
+        head, head_plain = out + text[last:m.start()], out_plain + plain[last:m.start()]
+        start = label_start(head_plain)
+        if start is None:
+            # No label: not a link to a reader, but `validate` reads the target as one.
+            out, out_plain = head, head_plain
+        else:
+            begin = start - 1 if start and head_plain[start - 1] == "!" else start
+            out, out_plain = head[:begin] + head[start + 1:], head_plain[:begin] + head_plain[start + 1:]
+        last = close.end()
+        dropped.append(m.group(2))
+    return out + text[last:], dropped
 
 
 def relocated(target, src_dir, dest_dir):
@@ -716,25 +765,25 @@ def in_force(records, names):
     restated (superseded by it) is left out: the record already says it.
 
     Yields (name, via) in reading order: via is None for a name in `names` (unknown ones included, not followed),
-    else (relation, the record it relates to). A record linked in `names` is read at its own place, never as a follower."""
-    seen = set()
-
-    def visit(name, via):
+    else (relation, the record it relates to). A record linked in `names` is read at its own place, never as a follower.
+    Depth first with a stack of its own: a chain of changes can be longer than Python's recursion limit."""
+    seen, stack = set(), [iter([(name, None) for name in names])]
+    while stack:
+        name, via = next(stack[-1], (None, None))
+        if name is None:
+            stack.pop()
+            continue
         if name in seen:
-            return
+            continue
         seen.add(name)
         yield name, via
         r = records.get(name)
         if r is None or r.meta.get("status") == "retired":
-            return
-        superseded = r.meta.get("status") == "superseded" and r.meta.get("superseded-by")
-        key, relation = ("superseded-by", "supersedes") if superseded else ("amended-by", "amends")
-        for x in r.meta.get(key) or []:
-            if x in records and x not in names and not (key == "amended-by" and name in (records[x].meta.get("superseded-by") or [])):
-                yield from visit(x, (relation, name))
-
-    for name in names:
-        yield from visit(name, None)
+            continue
+        # Superseded with no successor left (it was deleted): no longer in force, and nothing follows it.
+        key, relation = ("superseded-by", "supersedes") if r.meta.get("status") == "superseded" else ("amended-by", "amends")
+        stack.append(iter([(x, (relation, name)) for x in r.meta.get(key) or []
+                           if x in records and x not in names and not (key == "amended-by" and name in (records[x].meta.get("superseded-by") or []))]))
 
 
 def consolidation_candidates(adrs, tasks):
@@ -745,12 +794,22 @@ def consolidation_candidates(adrs, tasks):
     frontmatter to record a successor in."""
     live = {n: r for n, r in adrs.items() if r.meta.get("status") in LIVE_STATUSES and not r.legacy}
     parents = {n: [p for p in r.meta.get("amends") or [] if p in live] for n, r in live.items()}
-    roots = {}
+    roots, visiting = {}, set()
 
     def roots_of(n):
-        if n not in roots:
-            roots[n] = set()  # an `amends` cycle would otherwise recurse forever
-            roots[n] = {n} if not parents[n] else set().union(*(roots_of(p) for p in parents[n]))
+        # Iterative, since an `amends` chain can be longer than Python's recursion limit; a parent still being visited
+        # is an `amends` cycle and counts as having no roots.
+        stack = [n]
+        while stack:
+            x = stack[-1]
+            if x in roots:
+                stack.pop()
+            elif x not in visiting:
+                visiting.add(x)
+                stack += [p for p in parents[x] if p not in roots and p not in visiting]
+            else:
+                roots[x] = {x} if not parents[x] else set().union(*(roots.get(p, set()) for p in parents[x]))
+                stack.pop()
         return roots[n]
 
     found = {}
@@ -775,6 +834,13 @@ def stale_question(q, tasks):
     linked = (q.meta.get("tasks") or []) + (q.meta.get("blocks") or [])
     return (q.state == "open" and bool(linked) and not deferred(q, tasks)
             and all(tasks.get(s, Task(None, None, None, {})).state == "done" for s in linked))
+
+
+def check_areas(areas):
+    """Fails on an area that can't be written into a frontmatter list and read back as itself."""
+    for a in areas:
+        if not a.strip() or any(c in a for c in ",[]\n\r"):
+            raise Error(f"invalid area {a!r}: an area is a non-empty path without commas, brackets or newlines")
 
 
 def retired_as(meta):
@@ -1168,6 +1234,7 @@ def cmd_record(args):
     """Creates an ADR or a business rule (`args.kind`), and points the records it amends or supersedes at it."""
     kind = args.kind
     check_slug(args.slug)
+    check_areas(args.areas)
     proj = find_project(args.dir)
     for name, r in proj.all_records().items():
         m = RECORD_RE.match(name + ".md")
@@ -1252,6 +1319,26 @@ def delete_records(proj, records, names):
     live += [x for x in [*proj.questions().values(), *proj.ideas().values()] if x.state == "open"]
     links = [(item, (ADR.link, RULE.link)) for item in live]
     links += [(r, ("supersedes", "amends", "superseded-by", "amended-by")) for n, r in records.items() if n not in names and not r.legacy]
+    # A link to a deleted file keeps its text: the sentence around it still reads, and nothing points at a missing file.
+    gone = {os.path.abspath(records[n].path): n for n in names}
+    files = {os.path.basename(p) for p in gone}
+    rewrites = []
+    for path in data_markdown(proj):
+        if os.path.abspath(path) in gone:
+            continue
+        with open(path) as fh:
+            text = fh.read()
+        if not any(f in text for f in files):
+            continue
+        top = os.path.dirname(path)
+        target_of = lambda t: gone.get(os.path.abspath(os.path.join(top, urllib.parse.unquote(t.partition("#")[0]))))
+        new, dropped = drop_links(text, lambda t: target_of(t) is not None)
+        if dropped:
+            rewrites.append((path, new, {target_of(t) for t in dropped}))
+    for path, text, dropped in rewrites:
+        with open(path, "w") as fh:
+            fh.write(text)
+        print(f"rewrote links to {', '.join(sorted(dropped))} in {path}")
     for item, keys in links:
         removed = []
         for key in keys:
@@ -1261,9 +1348,14 @@ def delete_records(proj, records, names):
                 removed += [x for x in current if x in names and x not in removed]
         if removed:
             print(f"unlinked {', '.join(removed)} from {item.path}")
+        if item.meta.get("status") == "superseded" and set(item.meta.get("superseded-by") or []) <= names and item.meta.get("superseded-by"):
+            print(f"{item.path}: superseded with no successor left, so it is no longer in force")
     for name in sorted(names):
         os.remove(records[name].path)
         print(f"deleted {records[name].path}")
+    if try_toplevel(proj.root):
+        files = " ".join(f"-e {os.path.basename(records[n].path)}" for n in sorted(names))
+        print(f"note: files outside the data root (a README, code) are not rewritten; `git grep -nF {files}` finds what still links to them")
 
 
 def cmd_records(args):
@@ -1528,6 +1620,66 @@ def cmd_link(args):
                 warn_amended(records, old, current + [args.slug] if args.slug not in current else current)
 
 
+def cmd_unlink(args):
+    """Removes `amends` relations from an ADR or business rule that turned out to be a separate decision, on both sides."""
+    proj = find_project(args.dir)
+    records = proj.all_records()
+    for name in [args.slug, *args.amends]:
+        if name not in records:
+            raise Error(f"unknown architecture decision or business rule: {name}")
+        if records[name].legacy:
+            raise Error(f"{records[name].path} has no frontmatter to record links in")
+    r = records[args.slug]
+    for old in args.amends:
+        if old not in (r.meta.get("amends") or []):
+            raise Error(f"{args.slug} doesn't amend {old}")
+    set_meta(r.path, "amends", [x for x in r.meta.get("amends") or [] if x not in args.amends])
+    for old in args.amends:
+        set_meta(records[old].path, "amended-by", [x for x in records[old].meta.get("amended-by") or [] if x != args.slug])
+        print(f"{args.slug} no longer amends {old}")
+
+
+def cmd_set(args):
+    """Sets the title or areas of an ADR, business rule or spec: frontmatter nobody is meant to edit by hand."""
+    proj = find_project(args.dir)
+    if args.title is None and args.areas is None:
+        raise Error("nothing to set: give --title or --areas")
+    title = None if args.title is None else args.title.strip()
+    if title == "":
+        raise Error("--title can't be empty")
+    if title and ("\n" in title or "\r" in title):
+        raise Error("--title can't contain a newline")
+    check_areas(args.areas or [])
+    records, specs = proj.all_records(), proj.specs()
+    found = [x for x in (records.get(args.name), specs.get(args.name)) if x]
+    if not found:
+        raise Error(f"unknown architecture decision, business rule or spec: {args.name}")
+    if len(found) > 1:
+        label = found[0].kind.label
+        raise Error(f"{args.name} is both {'an' if label[0] in 'aeiou' else 'a'} {label} and a spec")
+    item = found[0]
+    if getattr(item, "legacy", False):
+        raise Error(f"{item.path} has no frontmatter to record it in")
+    note = ""
+    if title is not None:
+        old = item.meta.get("title", "")
+        set_meta(item.path, "title", title)
+        with open(item.path) as f:
+            text = f.read()
+        body = FRONTMATTER_RE.match(text).end()
+        heading = re.search(r"^# (.*)$", without_code(text[body:]), re.M)
+        real = heading and text[body + heading.start(1):body + heading.end()].strip()
+        if heading and real == old:
+            text = text[:body + heading.start()] + f"# {title}" + text[body + heading.end():]
+            with open(item.path, "w") as f:
+                f.write(text)
+        elif heading:
+            note = f"; left its heading `# {real}` as it was, since it isn't the old title"
+    if args.areas is not None:
+        set_meta(item.path, "areas", args.areas)
+    print(f"updated {args.name}{note}")
+
+
 def cmd_defer(args):
     proj = find_project(args.dir)
     q = proj.get_question(args.slug)
@@ -1548,6 +1700,7 @@ def deferred(q, tasks):
 
 def cmd_spec(args):
     check_slug(args.slug)
+    check_areas(args.areas)
     proj = find_project(args.dir)
     if args.slug in proj.specs():
         raise Error(f"spec {args.slug} already exists")
@@ -1791,6 +1944,8 @@ def brief_parts(data, slug, review=False, full=False):
         successors = r.meta.get("superseded-by") or []
         if r.meta.get("status") == "superseded" and successors:
             files.append((label, r.path, (), ("superseded", f"Superseded by {', '.join(successors)}: read that instead."), doc))
+        elif r.meta.get("status") == "superseded":
+            files.append((label, r.path, (), ("superseded", "Superseded, with no successor: no longer in force."), doc))
         elif r.meta.get("status") == "retired":
             files.append((label, r.path, (), ("retired", f"Retired: {retired_as(r.meta)}."), doc))
         else:
@@ -2064,6 +2219,19 @@ def cmd_close_idea(args):
     print(proj.move(i.path, os.path.join(proj.ideas_dir, "closed")))
 
 
+def data_markdown(proj):
+    """The markdown files of the task data, whose links `validate` checks and `retire --delete` rewrites: the project
+    docs, and everything under tasks, questions, ideas, specs, ADRs and business rules. Not the rest of a data root,
+    which may be a repo's root with vendored or generated files."""
+    for name in PROJECT_DOCS:
+        if os.path.isfile(doc_path(proj, name)):
+            yield doc_path(proj, name)
+    for d in (proj.tasks_dir, proj.questions_dir, proj.ideas_dir, *(os.path.join(proj.root, x) for x in ("specs", ADR.dir, RULE.dir))):
+        for top, dirs, files in os.walk(d):
+            dirs.sort()
+            yield from (os.path.join(top, f) for f in sorted(files) if f.endswith(".md"))
+
+
 def check_review_checks(path):
     """A reviewer reads checks from many files at once: each must be one bullet it can tick, and few enough to read."""
     bullets, prose = review_checks(path)
@@ -2093,16 +2261,12 @@ def accumulations(proj, tasks, questions, records, specs):
         if sum(counts) > CHECKS_AREA_MAX:
             out.append(f"area {area} collects {sum(counts)} review checks from {len(counts)} records: retire the ones a test or lint "
                        f"enforces (maintenance.md; `sdd checks --area {area}`)")
-    for d in (proj.tasks_dir, proj.questions_dir, proj.ideas_dir, *(os.path.join(proj.root, x) for x in ("specs", ADR.dir, RULE.dir))):
-        for top, _, names in os.walk(d):
-            for n in sorted(names):
-                if not n.endswith(".md"):
-                    continue
-                path = os.path.join(top, n)
-                with open(path) as f:
-                    broken = [t for t, p in link_targets(f.read()) if p and not os.path.exists(os.path.join(top, urllib.parse.unquote(p)))]
-                if broken:
-                    out.append(f"{path}: links that don't resolve: {', '.join(broken)}")
+    for path in data_markdown(proj):
+        with open(path) as f:
+            top = os.path.dirname(path)
+            broken = [t for t, p in link_targets(f.read()) if p and not os.path.exists(os.path.join(top, urllib.parse.unquote(p)))]
+        if broken:
+            out.append(f"{path}: links that don't resolve: {', '.join(broken)}")
     return out
 
 
@@ -2311,10 +2475,13 @@ def cmd_validate(args):
         if state == "open" and not meta.get("areas"):
             warnings.append(f"{path}: no areas, so `sdd context` won't show it when planning in its areas")
     warnings += accumulations(proj, tasks, questions, records, specs)
+    data = Loaded(proj)
+    data.tasks, data.questions, data.specs, data.records = tasks, questions, specs, records
     try:
-        sizes, _ = brief_costs(Loaded(proj))
-    except Error:
-        sizes = {}  # what stops the briefs from loading is reported above
+        sizes, _ = brief_costs(data)
+    except Error as e:
+        sizes = {}
+        warnings.append(f"can't compute the median brief size: {e}")
     if sizes and statistics.median(sizes.values()) > BRIEF_MAX / 2:
         warnings.append(f"the median brief of the {len(sizes)} live tasks is {int(statistics.median(sizes.values()))} bytes, over half of "
                         f"the {BRIEF_MAX} a tool prints in full: `sdd cost` shows the docs that cost the most to read (maintenance.md)")
@@ -2593,12 +2760,13 @@ def main():
     s.set_defaults(fn=cmd_accept)
 
     s = sub.add_parser("retire", help="retire architecture decisions or business rules that recorded a detail, not a decision: they leave force and point at the specs that describe it; "
-                       "--delete removes an outdated one that adds nothing")
+                       "--delete removes an outdated one that adds nothing, and the links to it from the data root's files")
     s.add_argument("names", nargs="+", metavar="NAME", help="file names without .md")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--into", nargs="+", action="extend", default=[], metavar="SPEC", help="the specs that now describe the detail")
     g.add_argument("--delete", action="store_true", help="delete the files, in any status, and unlink them from live tasks, specs, open questions and ideas "
-                   "and from other records; done tasks, answered questions and closed ideas keep the names as history")
+                   "and from other records; done tasks, answered questions and closed ideas keep the names as history. Links to "
+                   "the files from markdown under the data root become their text")
     s.set_defaults(fn=cmd_retire)
 
     s = sub.add_parser("adrs", help="list architecture decisions by how many tasks and specs reference them: name, status, refs, areas, title")
@@ -2649,6 +2817,17 @@ def main():
     s.add_argument("--amends", nargs="+", action="extend", default=[], metavar="ADR")
     s.add_argument("--supersedes", nargs="+", action="extend", default=[], metavar="ADR")
     s.set_defaults(fn=cmd_link)
+
+    s = sub.add_parser("unlink", help="remove amends relations from an ADR or business rule that turned out to be a separate decision, on both sides")
+    s.add_argument("slug", metavar="RECORD")
+    s.add_argument("--amends", nargs="+", action="extend", required=True, metavar="OLD", help="the records it no longer amends")
+    s.set_defaults(fn=cmd_unlink)
+
+    s = sub.add_parser("set", help="set the title (and the matching `# ` heading) or replace the areas of an ADR, business rule or spec")
+    s.add_argument("name", help="an architecture decision, business rule or spec")
+    s.add_argument("--title")
+    s.add_argument("--areas", nargs="*", action="extend", metavar="AREA", help="the new areas, replacing the current ones; none clears them")
+    s.set_defaults(fn=cmd_set)
 
     s = sub.add_parser("dep", help="add or remove dependencies: TASK (or an open idea) depends on PREREQs")
     s.add_argument("action", choices=["add", "rm"])

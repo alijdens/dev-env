@@ -973,7 +973,9 @@ def test_retire_delete_removes_records_and_unlinks_them_from_what_is_live(repo):
     out = run("retire", old, cap, "--delete", cwd=repo).stdout.splitlines()
     assert sorted(out) == sorted([f"unlinked {old}, {cap} from {live['task']}", *(f"unlinked {old} from {p}" for p in list(live.values())[1:]),
                                   f"unlinked {old} from {docs / f'arch/{fix}.md'}", f"unlinked {old} from {docs / f'arch/{newer}.md'}",
-                                  f"deleted {docs / f'arch/{old}.md'}", f"deleted {docs / f'rules/{cap}.md'}"])
+                                  f"deleted {docs / f'arch/{old}.md'}", f"deleted {docs / f'rules/{cap}.md'}",
+                                  f"note: files outside the data root (a README, code) are not rewritten; `git grep -nF -e {cap}.md -e {old}.md` "
+                                  "finds what still links to them"])
     assert not (docs / f"arch/{old}.md").exists() and not (docs / f"rules/{cap}.md").exists()
     assert f"arch: [{keep}]\nrules: []" in live["task"].read_text()
     assert "amends: []" in (docs / f"arch/{fix}.md").read_text() and "supersedes: []" in (docs / f"arch/{newer}.md").read_text()
@@ -990,7 +992,229 @@ def test_retire_delete_removes_records_and_unlinks_them_from_what_is_live(repo):
     errors = [line for line in run("validate", cwd=repo, check=False).stdout.splitlines() if line.startswith("error:")]
     assert sorted(errors) == sorted(f"error: {p}: unknown architecture decision {old}" for p in live.values())
 
-    assert run("retire", "2020-01-01-legacy", "--delete", cwd=repo).stdout == f"deleted {legacy}\n"
+    assert run("retire", "2020-01-01-legacy", "--delete", cwd=repo).stdout.splitlines()[0] == f"deleted {legacy}"
+
+
+def test_retire_delete_turns_links_to_the_deleted_files_into_their_text(repo, tmp_path):
+    docs = repo / "docs"
+    old, keep = adr(repo, "old", "--title", "Old"), adr(repo, "keep", "--title", "Keep")
+    run("new", "shipped", "--title", "Shipped", cwd=repo)
+    (docs / "tasks/done/2026-01-01").mkdir(parents=True)
+    done = docs / "tasks/done/2026-01-01/shipped.md"
+    (docs / "tasks/todo/shipped.md").rename(done)
+    done.write_text(done.read_text() + f"Follows [the old ADR](../../../arch/{old}.md#decision) and [keep](../../../arch/{keep}.md); "
+                    f"`[x](../../../arch/{old}.md)` is code.\n\n```\n[y](../../../arch/{old}.md)\n```\n")
+    keep_path = docs / f"arch/{keep}.md"
+    keep_path.write_text(keep_path.read_text() + f"\nAfter [Old]({old}.md) and ![its diagram]({old}.md).\n\nAn open [bracket.\n\nNot a link]({old}.md).\n")
+    old_path = docs / f"arch/{old}.md"
+    old_path.write_text(old_path.read_text() + f"\nSee [this record]({old}.md).\n")
+    (docs / "goal.md").write_text(f"# Goal\n\nSee [the [old] one](arch/{old}.md).\n")
+    (docs / ".drafts").mkdir()
+    (docs / ".drafts/x.md").write_text(f"[old](../arch/{old}.md)\n")
+    (repo / "README.md").write_text(f"[old](docs/arch/{old}.md)\n")
+    before = {p: p.read_text() for p in (done, keep_path, docs / "goal.md", docs / ".drafts/x.md", repo / "README.md")}
+    assert "unknown architecture decision or business rule: nope" in fails("retire", old, "nope", "--delete", cwd=repo)
+    assert {p: p.read_text() for p in before} == before
+
+    out = run("retire", old, "--delete", cwd=repo).stdout.splitlines()
+    assert [line for line in out if line.startswith("rewrote")] == [f"rewrote links to {old} in {p}" for p in (docs / "goal.md", done, keep_path)]
+    assert out[-1].startswith("note: files outside the data root (a README, code) are not rewritten")
+    assert (f"Follows the old ADR and [keep](../../../arch/{keep}.md); `[x](../../../arch/{old}.md)` is code.\n\n```\n[y](../../../arch/{old}.md)\n```\n"
+            in done.read_text())
+    assert "\nAfter Old and its diagram.\n\nAn open [bracket.\n\nNot a link.\n" in keep_path.read_text()
+    assert "See the [old] one.\n" in (docs / "goal.md").read_text()
+    assert all(p.read_text() == before[p] for p in (repo / "README.md", docs / ".drafts/x.md"))
+    assert "links that don't resolve" not in run("validate", cwd=repo, check=False).stdout
+
+    run("init", "--local", tmp_path / "data", cwd=repo)  # outside any git repo: no note
+    gone = adr(repo, "gone", "--title", "Gone")
+    assert run("retire", gone, "--delete", cwd=repo).stdout == f"deleted {tmp_path / f'data/arch/{gone}.md'}\n"
+
+
+def test_unlink_removes_an_amends_relation_from_both_sides(repo):
+    base = adr(repo, "store", "--title", "Store")
+    fix, other = adr(repo, "store-fix", "--title", "Fix", "--amends", base), adr(repo, "store-ttl", "--title", "TTL", "--amends", base)
+    run("accept", base, fix, other, cwd=repo)
+    run("new", "a", "--title", "A", "--arch", base, cwd=repo)
+    assert f"warning: {base} has 2 amendments" in run("validate", cwd=repo).stdout
+    (repo / "docs/arch/2020-01-01-legacy.md").write_text("# Legacy\n\n- Status: accepted\n")
+
+    assert "unknown architecture decision or business rule: nope" in fails("unlink", "nope", "--amends", base, cwd=repo)
+    assert "unknown architecture decision or business rule: nope" in fails("unlink", fix, "--amends", base, "nope", cwd=repo)
+    assert "has no frontmatter" in fails("unlink", "2020-01-01-legacy", "--amends", base, cwd=repo)
+    assert f"{fix} doesn't amend {other}" in fails("unlink", fix, "--amends", base, other, cwd=repo)
+    assert f"amends: [{base}]" in (repo / f"docs/arch/{fix}.md").read_text()  # nothing written before the checks pass
+
+    assert run("unlink", fix, "--amends", base, cwd=repo).stdout == f"{fix} no longer amends {base}\n"
+    assert "amends: []" in (repo / f"docs/arch/{fix}.md").read_text()
+    assert f"amended-by: [{other}]" in (repo / f"docs/arch/{base}.md").read_text()
+    assert run("adrs", "--amended", cwd=repo).stdout.splitlines() == [f"{base}\t1\t1\t{other}\t"]
+    assert fix not in run("brief", "a", cwd=repo).stdout
+    assert "amendments" not in run("validate", cwd=repo).stdout
+
+
+def test_set_changes_the_title_and_areas_of_a_record_or_spec(repo):
+    a = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    path = repo / f"docs/arch/{a}.md"
+    assert run("set", a, "--title", "Sessions live in Redis", cwd=repo).stdout == f"updated {a}\n"
+    assert "title: Sessions live in Redis\n" in path.read_text() and "\n# Sessions live in Redis\n" in path.read_text()
+    path.write_text(path.read_text().replace("# Sessions live in Redis\n", "# A heading of its own\n"))
+    assert run("set", a, "--title", "Sessions survive restarts", cwd=repo).stdout == (
+        f"updated {a}; left its heading `# A heading of its own` as it was, since it isn't the old title\n")
+    assert "title: Sessions survive restarts\n" in path.read_text() and "\n# A heading of its own\n" in path.read_text()
+    run("set", a, "--areas", "backend/auth", "--areas", "web", cwd=repo)
+    assert "areas: [backend/auth, web]" in path.read_text() and "title: Sessions survive restarts" in path.read_text()
+
+    rule = record(repo, KINDS[1], "cap", "--title", "Cap")
+    run("set", rule, "--areas", "posting", cwd=repo)
+    assert "areas: [posting]" in (repo / f"docs/rules/{rule}.md").read_text()
+    spec = Path(run("spec", "keys", "--title", "Keys", cwd=repo).stdout.strip())
+    run("set", "keys", "--title", "Key format", "--areas", "backend", cwd=repo)
+    assert "title: Key format\nareas: [backend]" in spec.read_text() and "\n# Key format\n" in spec.read_text()
+
+    assert "nothing to set" in fails("set", a, cwd=repo)
+    assert "--title can't be empty" in fails("set", a, "--title", " ", cwd=repo)
+    assert "unknown architecture decision, business rule or spec: nope" in fails("set", "nope", "--title", "X", cwd=repo)
+    (repo / "docs/arch/2020-01-01-legacy.md").write_text("# Legacy\n\n- Status: accepted\n")
+    assert "has no frontmatter" in fails("set", "2020-01-01-legacy", "--title", "X", cwd=repo)
+    run("spec", a, "--title", "Same name", cwd=repo)
+    assert f"{a} is both an architecture decision and a spec" in fails("set", a, "--title", "X", cwd=repo)
+
+
+def test_set_title_updates_a_heading_with_code_in_it(repo):
+    a = adr(repo, "store", "--title", "Use `redis` for sessions")
+    run("set", a, "--title", "Use valkey for sessions", cwd=repo)
+    assert "\n# Use valkey for sessions\n" in (repo / f"docs/arch/{a}.md").read_text()
+
+
+def test_set_refuses_a_title_with_a_newline_and_strips_it(repo):
+    a = adr(repo, "store", "--title", "Store")
+    path = repo / f"docs/arch/{a}.md"
+    before = path.read_text()
+    assert "can't contain a newline" in fails("set", a, "--title", "A\nstatus: accepted", cwd=repo)
+    assert path.read_text() == before
+    run("set", a, "--title", "  Spaced  ", cwd=repo)
+    assert "title: Spaced\n" in path.read_text() and "\n# Spaced\n" in path.read_text()
+
+
+def test_set_areas_without_values_clears_them(repo):
+    a = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    run("set", a, "--areas", cwd=repo)
+    assert "areas: []" in (repo / f"docs/arch/{a}.md").read_text()
+    assert "nothing to set" in fails("set", a, cwd=repo)
+
+
+def rewritten_after_delete(repo, body):
+    """`body` appended to a spec, `OLD` standing for a link target to an ADR, as `retire --delete` of that ADR leaves it."""
+    old = adr(repo, "old", "--title", "Old")
+    spec = Path(run("spec", "notes", "--title", "Notes", cwd=repo).stdout.strip())
+    with open(spec, "a", newline="") as f:
+        f.write(body.replace("OLD", f"../arch/{old}.md"))
+    run("retire", old, "--delete", cwd=repo)
+    with open(spec, newline="") as f:
+        return f.read().split("## Summary\n", 1)[1].replace(f"../arch/{old}.md", "OLD")
+
+
+def test_retire_delete_rewrites_only_links_closed_where_they_end(repo):
+    body = '\n[x](OLD "Old (v1)") and [y](OLD (v2)).\n\nAn arr](OLD and later (see below).\n'
+    assert rewritten_after_delete(repo, body) == "\nx and y.\n\nAn arr](OLD and later (see below).\n"
+
+
+def test_retire_delete_rewrites_nested_links_to_their_text(repo):
+    assert rewritten_after_delete(repo, "\nSee [![diagram](OLD)](OLD).\n") == "\nSee diagram.\n"
+
+
+def test_retire_delete_reads_a_label_with_code_in_it(repo):
+    assert rewritten_after_delete(repo, "\nCall [`arr[`](OLD).\n") == "\nCall `arr[`.\n"
+
+
+def test_retire_delete_ends_a_paragraph_at_a_whitespace_only_line(repo):
+    body = "\nAn open [bracket.\n   \nNot a link](OLD).\n"
+    assert rewritten_after_delete(repo, body) == "\nAn open [bracket.\n   \nNot a link.\n"
+
+
+def test_retire_delete_reads_only_the_files_validate_checks(repo):
+    old = adr(repo, "old", "--title", "Old")
+    vendored = repo / "docs/node_modules/pkg/README.md"
+    vendored.parent.mkdir(parents=True)
+    vendored.write_text(f"[old](../../arch/{old}.md)\n")
+    (repo / "docs/build").mkdir()
+    (repo / "docs/build/bad.md").write_bytes(b"\xff\xfe not utf-8\n")
+    run("retire", old, "--delete", cwd=repo)
+    assert vendored.read_text() == f"[old](../../arch/{old}.md)\n"
+
+
+def test_validate_median_brief_reuses_what_validate_loaded(repo):
+    run("new", "big", "--title", "Big", cwd=repo)
+    task = repo / "docs/tasks/todo/big.md"
+    task.write_text(task.read_text() + "x" * 15_000 + "\n")
+    (repo / "docs/tasks/todo/broken.md").write_text("no frontmatter\n")
+    out = run("validate", cwd=repo, check=False).stdout
+    assert "broken.md: missing frontmatter" in out and "warning: the median brief of the 1 live tasks" in out
+
+
+def chain(repo, prefix, n, link):
+    """`n` ADRs each changed by the next: `link` "superseded-by" or "amended-by" (the next then amends it). Longer than
+    Python's recursion limit, so following it must not recurse."""
+    names = [f"2020-01-01-{prefix}{i}" for i in range(n)]
+    for i, name in enumerate(names):
+        status = "superseded" if link == "superseded-by" and i + 1 < n else "accepted"
+        fields = f"{link}: [{names[i + 1]}]\n" if i + 1 < n else ""
+        fields += f"amends: [{names[i - 1]}]\n" if link == "amended-by" and i else ""
+        (repo / f"docs/arch/{name}.md").write_text(f"---\ntitle: {prefix}{i}\nstatus: {status}\ndate: 2020-01-01\nareas: [x]\n{fields}---\n\n"
+                                                   f"# {prefix}{i}\n\n## Alternatives considered\n\nNone.\n\n## Review checks\n\n- Check {prefix}{i}.\n")
+    return names
+
+
+def test_long_chains_of_changed_records_render(repo):
+    superseded, amended = chain(repo, "s", 1200, "superseded-by"), chain(repo, "a", 1200, "amended-by")
+    run("new", "deep", "--title", "Deep", "--arch", superseded[0], amended[0], cwd=repo)
+    checks = run("checks", "--task", "deep", cwd=repo).stdout
+    assert "Check s1199." in checks and "Check s0." not in checks and "Check a0." in checks and "Check a1199." in checks
+    path = Path(run("brief", "deep", cwd=repo).stdout.rstrip().rsplit(" ", 1)[1])
+    try:
+        assert f"supersedes {superseded[1198]}: arch/{superseded[1199]}.md" in path.read_text()
+    finally:
+        path.unlink()
+    assert f"\tadr\t{superseded[1199]}" in run("cost", "--top", "3000", cwd=repo).stdout
+    assert f"{amended[0]} has 1199 amendments" in run("validate", cwd=repo).stdout
+
+
+def test_a_superseded_record_left_without_successor_is_a_pointer(repo):
+    base = adr(repo, "store", "--title", "Store")
+    path = repo / f"docs/arch/{base}.md"
+    path.write_text(path.read_text().replace("## Decision\n", "## Decision\n\nKeep it in memory.\n"))
+    fix = adr(repo, "store-fix", "--title", "Fix", "--amends", base)
+    newer = adr(repo, "store-redis", "--title", "Redis", "--supersedes", base)
+    run("new", "a", "--title", "A", "--arch", base, cwd=repo)
+    out = run("retire", newer, "--delete", cwd=repo).stdout
+    assert f"{path}: superseded with no successor left, so it is no longer in force\n" in out
+    out = run("brief", "a", cwd=repo).stdout
+    assert f"=== architecture decision: arch/{base}.md (superseded)\n\nSuperseded, with no successor: no longer in force.\n" in out
+    assert "Keep it in memory." not in out and fix not in out
+
+
+def test_retire_delete_leaves_escaped_brackets_alone(repo):
+    body = "\nLiteral \\[x\\](OLD) and [a \\] b](OLD).\n"
+    assert rewritten_after_delete(repo, body) == "\nLiteral \\[x\\](OLD) and a \\] b.\n"
+    assert "links that don't resolve" not in run("validate", cwd=repo, check=False).stdout
+
+
+@pytest.mark.parametrize("area", ["backend, web", "", " ", "x]", "[x", "a\nb"])
+def test_areas_that_would_corrupt_the_list_are_refused(repo, area):
+    a = adr(repo, "store", "--title", "Store", "--areas", "backend")
+    path = repo / f"docs/arch/{a}.md"
+    before = path.read_text()
+    assert "invalid area" in fails("set", a, "--areas", "web", area, cwd=repo)
+    assert path.read_text() == before
+    for cmd in (["adr", "other", "--title", "O"], ["rule", "other", "--title", "O"], ["spec", "other", "--title", "O"]):
+        assert "invalid area" in fails(*cmd, "--areas", area, cwd=repo)
+    assert not list((repo / "docs").glob("*/*other*"))
+
+
+def test_validate_checks_the_links_of_the_project_docs(repo):
+    fill_doc(Path(run("doc", "new", "goal", cwd=repo).stdout.strip()), filler="See [gone](arch/gone.md).")
+    assert f"warning: {repo / 'docs/goal.md'}: links that don't resolve: arch/gone.md" in run("validate", cwd=repo).stdout
 
 
 def test_retired_rules_are_not_in_force(repo):

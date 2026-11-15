@@ -57,8 +57,9 @@ Records start `proposed`; `sdd accept <name>...` marks ADRs and rules accepted o
 
 - **The decision or rule changes but its intent holds** (it was worded too narrowly, a case showed it wrong, it grew): the record is edited so it states the whole decision again. `sdd validate` warns that an accepted record changed, and the user agrees to the change before it merges, as for a new record.
 - **It is replaced by a different decision**: a new record with `--supersedes <old>`. The old one keeps its text and gets `superseded-by:` and status `superseded`, and `sdd brief` prints the new one in its place.
-- **It recorded a detail, not a decision**: `sdd retire <name> --into <spec>`, once the spec says it. When it is outdated or says nothing the code and the specs don't, it is deleted instead: `sdd retire <name> --delete` removes the file and unlinks it from live tasks, specs, questions and ideas.
+- **It recorded a detail, not a decision**: `sdd retire <name> --into <spec>`, once the spec says it. When it is outdated or says nothing the code and the specs don't, it is deleted instead: `sdd retire <name> --delete` removes the file, unlinks it from live tasks, specs, questions and ideas, and turns the links to it in other docs into their text.
 - A slip (a wrong name, a stale path) is just fixed, and `## Review checks` (below) change as reviews learn.
+- Its title or its areas: `sdd set <name> --title "..." --areas <area>...`, since frontmatter isn't edited by hand. A record that turns out to be a decision of its own, not a change to the one it was said to amend, drops that relation with `sdd unlink <name> --amends <old>`.
 
 A record in force, or one whose reasons a later reader would miss, is never deleted by hand: tasks and code comments reference it by name. Done tasks and answered questions keep a deleted record's name as history, and git keeps its text.
 
