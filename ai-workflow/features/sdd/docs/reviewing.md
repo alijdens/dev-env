@@ -1,8 +1,8 @@
 # Task Workflow: Reviewing a Task's PR
 
-A review checks that a PR delivers its task as planned, and nothing else. It is read-only: report the findings, and don't fix, comment on, approve or merge the PR unless asked. If the PR isn't checked out, fetch its head into a detached temporary worktree (the review exception in the general guidelines), creating no branches or refs in the repo. Probes (a mutant, a build, a run) go in a fresh `mktemp -d` of their own with their own caches, never in a scratch directory other agents may use, and are removed afterwards: a tree mixed from two PRs builds nothing meaningful.
+A review checks that a PR delivers its task as planned, and nothing else. It is read-only: report the findings, and don't fix, comment on, approve or merge the PR unless asked. If the PR isn't checked out, fetch its head into a detached temporary worktree (the review exception in the general guidelines), creating no branches or refs in the repo. Probes (a mutant, a build, a run) go in a worktree only the reviewer uses: that detached temporary worktree or, when someone else (the user, a worker) already has the PR checked out, another detached worktree of its head. Never probe in the worker's or the user's checkout, or in a scratch directory other agents may use: a tree mixed from two PRs builds nothing meaningful. Restore each mutant before the next probe, and remove the worktree afterwards with `git worktree remove`, not `rm -rf`.
 
-The project's full check suite is the implementer's job and CI's, not the reviewer's: verify that the PR names the commit the checks ran on and that it is the head under review, and run only the targeted checks the findings need.
+The project's full check suite is the implementer's job and CI's, not the reviewer's: verify that the commit the checks ran on, given with the review request or named in the PR, is the head under review, and run only the targeted checks the findings need.
 
 When a check below is added or changed because something slipped through a review, the case goes in `lessons.md`, so the reason survives the edit.
 
@@ -106,7 +106,7 @@ A task left in the wrong state blocks the workflow: a task stuck in `in-progress
 
 ### Tests test the feature
 
-For each new or changed test, ask whether it would fail if the feature were broken. For every guard, bound or branch the task or the description claims is covered, check it the way `../testing.md` ("Prove a test can fail") says: remove the guarded line in your scratch copy and run the test; a test that still passes is a finding, and a probe that hangs means the test needs a bound. Flag tests that wouldn't fail:
+For each new or changed test, ask whether it would fail if the feature were broken. For every guard, bound or branch the task or the description claims is covered, check it the way `../testing.md` ("Prove a test can fail") says: remove the guarded line in your probe worktree and run the test; a test that still passes is a finding, and a probe that hangs means the test needs a bound. Flag tests that wouldn't fail:
 
 - The unit under test is itself mocked, or the mocks are configured to return the result the test then asserts.
 - Assertions only check that a mock was called, where the actual output or effect is observable.
@@ -135,7 +135,7 @@ Following `../testing.md`, flag tests, new or existing, that can be removed or m
 
 ## Re-reviews
 
-A round after fixes comes with the commit range of the fixes and the findings decided so far. Verify that each accepted finding is fixed, review the changed hunks with the checks above, and re-run `sdd validate`; don't re-review code the round didn't touch, and don't raise what was rejected. New findings are for regressions and for what the fixes introduced: say for each whether the fixes introduced it or it was there before, so the orchestrator can tell a loop that converges from one that doesn't. The report still ends with the risk level, rated on the PR as it now stands.
+A round after fixes comes with the commit range of the fixes and the findings decided so far. Verify that each accepted finding is fixed, review the changed hunks with the checks above, and re-run `sdd validate`; don't re-review code the round didn't touch, and don't raise what was rejected. When the range holds a merge from main, review the fix commits, not what main brought in. New findings are for regressions and for what the fixes introduced: say for each whether the fixes introduced it or it was there before, so the orchestrator can tell a loop that converges from one that doesn't. The report still ends with the risk level, rated on the PR as it now stands.
 
 ## Report
 
