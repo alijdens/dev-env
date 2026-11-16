@@ -1,6 +1,6 @@
 # ai-workflow
 
-Centralized, tool-agnostic instructions for AI coding assistants (Claude Code, Codex, ...). Edit once here, `git pull` on any machine, and every configured tool picks up the change.
+Centralized, tool-agnostic instructions for AI coding assistants (Claude Code, Codex, Antigravity, ...). Edit once here, `git pull` on any machine, and every configured tool picks up the change.
 
 ## Layout
 
@@ -33,7 +33,7 @@ The rest:
 
 ```sh
 ./install.sh                     # all tools; the features installed last time, or all on a first install
-./install.sh claude              # only for Claude Code (also codex, agents)
+./install.sh claude              # only for Claude Code (also codex, agents, agy)
 ./install.sh --features a,b      # core + features a and b; replaces the installed selection
 ./install.sh --features none     # core only: unlinks everything the other features installed
 ./install.sh --list              # features, and which ones are installed
@@ -46,6 +46,7 @@ This creates:
 | Claude Code      | `~/.claude/CLAUDE.md`, `~/.claude/docs`, `~/.claude/skills/<skill>`, `~/.claude/skills/<plugin>` |
 | Codex            | `~/.codex/AGENTS.md`, `~/.codex/docs`, `~/.codex/skills/<skill>`    |
 | Agents (generic) | `~/.agents/AGENTS.md`, `~/.agents/docs`, `~/.agents/skills/<skill>` |
+| Antigravity CLI (`agy`) | `~/.gemini/AGENTS.md`, `~/.gemini/docs`, `~/.gemini/skills/<skill>` |
 
 Re-running is safe: existing correct symlinks are left alone, and any pre-existing real file/dir is backed up (`*.bak.<timestamp>`) before being replaced. Skills and plugins are linked one by one, so ones installed from elsewhere stay in the same `skills/` dir; links to ones removed from this repo or from the selection are cleaned up, for every tool.
 
