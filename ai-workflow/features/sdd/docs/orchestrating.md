@@ -47,6 +47,8 @@ The orchestrator applies the plan; it doesn't change it. Three things are the us
 - **A decision a worker added.** An implementation PR that adds a `proposed` ADR or business rule carries a decision the user hasn't seen: it may merge under the policy, but the report lists every such record under "decisions awaiting acceptance". One that supersedes an accepted record, or changes what one says, is a hold (below).
 - **Facts not in the plan.** Context added to a worker's prompt is quoted from the task, its ADRs, business rules, specs or questions, with the source named. What the orchestrator can't source that way isn't sent as context; if the worker needs it, it's a question.
 
+**Asking the user.** Only a question that blocks the run (nothing in flight can move until it's answered) is asked with the tool's blocking question, and a push notification goes with it if the tool can send one. Everything else isn't asked: a notice, a held PR, or a decision the run can wait on while other tasks move goes to the tool's list of pending items, if it keeps one, with the options in its context, and the run continues. An item is resolved once the user answers it.
+
 ### Held PRs
 
 When one of the above comes up on a PR that already exists, the run holds it instead of guessing or discarding the work:
