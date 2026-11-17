@@ -1,0 +1,5 @@
+{
+  "name": "redact-secrets",
+  "version": "0.1.0",
+  "description": "Replaces secret values in tool results with [REDACTED:NAME] before the model reads them, with a note on how to check a secret without printing it."
+}

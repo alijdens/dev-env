@@ -31,6 +31,7 @@ If a task can't be fulfilled because something looks like an error, stop — don
 - Chain dependent steps with `&&` and read the exit code yourself; don't take a notification or a log tail for a result. Keep a log until the step that needed it has succeeded.
 - Scratch work (a probe, a copy of a repo, a build) goes in a fresh `mktemp -d` with caches of its own, removed when done. Never remove or rebuild caches, containers or volumes that other sessions on the machine may share.
 - Secrets: read one from an environment variable, never print or paste it, and check the diff for it before committing.
+- To find out whether a secret exists, use the `secrets` CLI, never `echo`/`printenv`/`env`/`cat`/`grep` or a one-liner of your own, which put the value in your context: `secrets has NAME` (checks the current env and the env files of the current directory, and says where it is set), `secrets list` (names only, grouped by source); `--env` and `--file PATH` narrow either to the sources you name. For anything else, e.g. handing a value to another command, read `secrets --help` first.
 - When stating what a file, doc or API says, point at where (file and line, section); mark anything recalled from memory as such.
 - Do what was asked or say it can't be done. Don't quietly park an unmet requirement in a note, a TODO or a question and report the work as finished.
 

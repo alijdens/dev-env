@@ -100,7 +100,7 @@ def test_features_install_and_uninstall_as_a_unit(setup):
     install(wf, env, "--features", "none", "claude")
     for part in ["skills/demo-skill", "plugins/claude-code/demo-plugin", "bin/demo", "docs/demo"]:
         assert not (rendered / part).exists()
-    assert sorted(p.name for p in (home / ".claude/skills").iterdir()) == ["pending-items"]
+    assert sorted(p.name for p in (home / ".claude/skills").iterdir()) == ["pending-items", "redact-secrets"]
     assert (rendered / "bin/pull-pr-description").is_file()
 
     install(wf, env, "--refresh")  # the git hooks keep the selection
