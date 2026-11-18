@@ -1913,3 +1913,45 @@ def test_main_flag_reads_the_remote_branch_for_read_only_commands(shared, repo, 
 
     run("init", "--local", tmp_path / "data", cwd=repo)
     assert "local mode" in fails("--main", "ready", cwd=repo)
+
+
+def test_changes_tells_docs_from_code_and_tasks_that_left_the_open_states(repo):
+    run("new", "a", "--title", "A", cwd=repo)
+    run("new", "b", "--title", "B", cwd=repo)
+    (repo / "README.md").write_text("# Repo\n")
+    (repo / "prompts").mkdir()
+    (repo / "prompts/system.md").write_text("You are a scheduler.\n")
+    commit_all(repo, "base")
+    base = git("rev-parse", "HEAD", cwd=repo)
+
+    def changes(*docs):
+        return run("changes", f"{base}..HEAD", *(["--docs", *docs] if docs else []), cwd=repo).stdout.splitlines()
+
+    git("mv", "docs/tasks/todo/a.md", "docs/tasks/in-progress/a.md", cwd=repo)  # a claim: still open
+    (repo / "README.md").write_text("# The repo\n")
+    commit_all(repo)
+    assert changes() == ["code", "  README.md"]  # Markdown is code unless named
+    assert changes("README.md") == ["docs"]
+
+    (repo / "prompts/system.md").write_text("You are a booking assistant.\n")
+    commit_all(repo)
+    assert changes("README.md") == ["code", "  prompts/system.md"]
+    git("checkout", base, "--", "prompts", cwd=repo)
+    commit_all(repo)
+    git("mv", "prompts/system.md", "docs/system.md", cwd=repo)
+    commit_all(repo)
+    assert changes("README.md") == ["code", "  prompts/system.md"]  # moved into the data root, gone from where code read it
+    git("mv", "docs/system.md", "prompts/system.md", cwd=repo)
+    commit_all(repo)
+
+    (repo / "docs/tasks/done/2026-11-18").mkdir(parents=True)
+    git("mv", "docs/tasks/in-progress/a.md", "docs/tasks/done/2026-11-18/a.md", cwd=repo)
+    git("mv", "docs/tasks/todo/b.md", "docs/tasks/todo/b2.md", cwd=repo)
+    commit_all(repo)
+    assert changes("README.md") == ["tasks", "  a", "  b"]
+
+    agents = repo / "AGENTS.md"
+    agents.write_text(agents.read_text().replace("sdd: docs", "sdd: ./docs"))
+    commit_all(repo)
+    assert changes("README.md", "AGENTS.md") == ["code", "  the `sdd:` line in AGENTS.md or CLAUDE.md"]
+    assert run("changes", "HEAD", cwd=repo).stdout == "docs\n"

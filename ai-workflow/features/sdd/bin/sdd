@@ -1204,6 +1204,44 @@ def cmd_stale(args):
     print(f"up to date with {REMOTE}/{base}")
 
 
+def open_slugs(repo, rev, rel):
+    out = git("ls-tree", "-r", "--name-only", rev, "--", *(f"{rel}/tasks/{s}/" for s in OPEN_STATES), cwd=repo).stdout
+    return {os.path.basename(p)[:-3] for p in out.splitlines() if p.endswith(".md")}
+
+
+def marker_at(repo, rev):
+    for name in AGENT_FILES:
+        r = git("show", f"{rev}:{name}", cwd=repo, check=False)
+        m = MARKER_RE.search(r.stdout) if r.returncode == 0 else None
+        if m:
+            return m.group(1)
+    return None
+
+
+def cmd_changes(args):
+    """What a range of commits changed, so a project can tell which of its checks to run again: `code` when a file
+    outside the data root and the `--docs` paths changed, or the `sdd:` line that tells code where the data is;
+    `tasks` when only those changed but a task left the open states, for checks that read which tasks are open;
+    `docs` otherwise. Markdown isn't docs by default: code may read it as a prompt or a template."""
+    repo = toplevel()
+    old, _, new = args.range.partition("..")
+    if new.startswith("."):
+        raise Error("give a range as A..B (the commits B has that A doesn't diff from A itself, not from a merge base)")
+    old, new = old or "HEAD", new or "HEAD"
+    for rev in (old, new):
+        git("rev-parse", "--verify", "-q", f"{rev}^{{commit}}", cwd=repo)
+    proj = find_project(args.dir)
+    root, top = os.path.realpath(proj.root), os.path.realpath(repo)
+    rel = os.path.relpath(root, top) if root.startswith(top + os.sep) else None
+    excludes = [f":(exclude){p}" for p in ([rel] if rel else []) + args.docs]
+    code = git("diff", "--name-only", "--no-renames", old, new, "--", ".", *excludes, cwd=repo).stdout.splitlines()
+    if marker_at(repo, old) != marker_at(repo, new):
+        code.append("the `sdd:` line in " + " or ".join(AGENT_FILES))
+    gone = sorted(open_slugs(repo, old, rel) - open_slugs(repo, new, rel)) if rel else []
+    kind, items = ("code", code) if code else ("tasks", gone) if gone else ("docs", [])
+    print("\n  ".join([kind, *items]))
+
+
 def cmd_new(args):
     check_slug(args.slug)
     proj = find_project(args.dir)
@@ -2735,6 +2773,14 @@ def main():
     s = sub.add_parser("stale", help="fetch and fail if the data root is behind main or has uncommitted changes (run before planning)")
     s.add_argument("--fix", action="store_true", help="first drop uncommitted changes that already match main and fast-forward; changes that differ are kept")
     s.set_defaults(fn=cmd_stale)
+
+    s = sub.add_parser("changes", help="what a range of commits changed, to tell which checks to run again: code (with the files), tasks (only the data root and --docs paths, "
+                       "but tasks left todo, tech-debt or in-progress: finished, deleted or renamed) or docs")
+    s.add_argument("range", help="A..B, or A for A..HEAD: e.g. <commit the checks ran on>..HEAD, or $(git merge-base origin/main HEAD)..origin/main")
+    s.add_argument("--docs", nargs="+", action="extend", default=[], metavar="PATHSPEC",
+                   help="paths outside the data root that no check reads, as git pathspecs from the repo root (README.md '*/README.md'); "
+                        "never Markdown that code reads, such as a prompt or a template")
+    s.set_defaults(fn=cmd_changes)
 
     s = sub.add_parser("new", help="create a task in todo (or tech-debt)")
     s.add_argument("slug")

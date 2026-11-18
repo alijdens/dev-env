@@ -62,7 +62,8 @@ Thirteen PRs with three tasks in flight, in a project with no CI whose checks ha
 
 ## 2026-11-18: an orchestrated run where no PR passed its first review
 
-Twenty PRs, none approved in round 1. In seven, the first review's findings were what the reviewer read and the worker didn't:
+Twenty PRs, none approved in round 1. In seven, the first review's findings were what the reviewer read and the worker didn't, and the last fixes after the reviews cost more than they changed:
 
 - **Area checks only the reviewer ran.** Workers got the checks of what their task linked; reviewers added those of the areas the diff touched. Two PRs changed what the assistant shows without linking the rule that requires real-model evals for it, and one ran a migration without the deploy ADR's timing check. Each cost a fix round, and two of them a re-review too. Changed: the worker runs `sdd checks --area` on its diff before its checks, links what was missing and says so; the reviewer still picks the areas itself and reports the missing link as a planning finding.
 - **Dependents only the reviewer read.** Only the review brief carried the dependent tasks, whole, so three PRs were flagged on what their dependents would need, and most review briefs were too long to print. Changed: both briefs carry each dependent's Goal and criteria, without its Notes, and the worker is told to leave room for them, not to build them.
+- **Final low fixes on new workers.** Thirteen workers were started only for a round's last lows, some to edit four lines of prose or to record a tech-debt task, and each first loaded the docs, the brief and the PR. Changed: that fix goes to the worker that made the last commit, by message, where the tool can resume it. Their check runs went to the project: `sdd changes` tells a range that changed only docs from code, for its instructions to say what each needs.
