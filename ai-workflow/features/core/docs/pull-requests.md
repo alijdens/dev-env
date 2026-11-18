@@ -6,7 +6,7 @@ Load this file only when asked to commit or open a PR. These are general prefere
 
 - Branch off the current branch unless told so; never commit directly to the main branch.
 - Write commit messages as a short imperative subject line, plus a body only when the diff alone doesn't explain the *why*.
-- Run the repository's checks (format/lint/type/tests, pre-commit hooks) before committing or opening the PR, and again after every rebase, a docs-only one included. Name the commit the checks ran on when reporting them (the PR description or the report), so a reviewer can tell whether the checked tree is the one under review.
+- Run the repository's checks (format/lint/type/tests, pre-commit hooks) before committing or opening the PR, and again after every rebase or merge from the base branch, a docs-only one included. Name the commit the checks ran on when reporting them (the PR description or the report), so a reviewer can tell whether the checked tree is the one under review.
 - Before committing, make sure there are no unrelated files in the index to avoid accidentally including unrelated changes.
 
 ## PR size
@@ -39,7 +39,7 @@ Content rules that apply at every size:
 
 ### Showing user-facing changes
 
-When the change is something a user sees (a page, a component, a CLI's output, a rendered document) and a picture says more than a paragraph, show it: run the change and capture a screenshot, or a short recording for an interaction or an animation, and put it in the description, before/after for a change to something that already existed. Use whatever browser tooling the session has (a browser automation tool or extension that can open the running app and take screenshots or GIF recordings); start the app the way the repo's docs say and capture the real feature, not a mock. Crop to the relevant part and make sure no personal or private data is in the frame.
+When the change is something a user sees (a page, a component, a CLI's output, a rendered document) and a picture says more than a paragraph, show it: run the change and capture a screenshot, or a short recording for an interaction or an animation, and put it in the description, showing the new state; add a "before" only when the change can't be judged from the new image alone (a layout, spacing or colour fix, a restyle), since the reader can already see the existing state on the base branch. When the repo's docs name a command for capturing screens, use it instead of writing a capture script or driving a browser by hand; otherwise use whatever browser tooling the session has (a browser automation tool or extension that can open the running app and take screenshots or GIF recordings). Start the app the way the repo's docs say and capture the real feature, not a mock. Crop to the relevant part, at most a viewport-sized capture and never a full-page one, and make sure no personal or private data is in the frame.
 
 Skip it when the change isn't visible or an image adds nothing (a copy tweak the title already states, a change with no observable difference). If no browser tooling is available or the app can't be run in the session, leave a clearly marked placeholder for the author instead of describing what the screenshot would show.
 
@@ -64,7 +64,7 @@ Pick the structure matching what the PR is; for mixed PRs, lead with the dominan
 1. **Feature overview** — a short summary of what the change adds: the problem first, then the one-line shape of the solution. No implementation detail here.
 2. **Usage example** — how the feature is used, from the consumer's side:
    - For a code/API surface (lib function, endpoint, CLI, config): the smallest snippet a consumer would write, plus the observable runtime behavior (inputs, outputs, notable states).
-   - For UI: a screenshot or short recording (before/after when it's a change). See "Showing user-facing changes" below.
+   - For UI: a screenshot or short recording of the new state (plus a "before" only when the new image alone can't show what changed, e.g. a layout or colour fix). See "Showing user-facing changes" below.
    - Skip it for internal changes with no consumer-facing surface.
 3. **Implementation details** — only when the change spans several components; a layered, outside-in explanation of how the data flows:
    - A `mermaid` **data-flow** chart only when the path crosses several boundaries non-obviously (entry point → transport/persistence → runtime → effect). Never for a linear chain of two or three nodes.
