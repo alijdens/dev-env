@@ -35,4 +35,14 @@ The claim PR must be merged before implementing. Unless authorized to merge it, 
    - Separate data repo or local mode: the task stays `in-progress` until the PR merges. Whoever merges it (the user, or the orchestrator) then runs `sdd done <slug>`, which opens a PR in the data repo, or just moves the file in local mode. Say so in the PR description in the separate-repo case.
 7. **Abandon.** `sdd release <slug>` (add `--tech-debt` to park it there) opens a release PR moving it back, so someone else can pick it up.
 
+## Fix rounds
+
+In an orchestrated run, a fix round on an open PR starts at step 5 with the task already claimed, and its findings come as the ID of a review comment on the PR (`reviewing.md`, "In an orchestrated run"):
+
+1. Read it with `gh api repos/{owner}/{repo}/issues/comments/<id> --jq .body`. It holds everything the round needs, so the PR's other comments don't need reading. Its first line, `<!-- sdd-review pr=<number> round=<round> commit=<sha> -->`, must name the PR and round the prompt gave and the branch's head (`git rev-parse HEAD`); if it doesn't, stop and report the mismatch instead of fixing anything.
+2. Decide each finding: fix it, or reject it with a reason. Reject one only when what it claims isn't so, when it is out of the task's scope, or when a record or project doc says otherwise, never because the fix costs too much: the re-review judges each reason and re-raises the ones that don't hold. A finding flagged `hold`, or one the orchestrator decided, goes as the prompt says.
+3. Fix, run the checks (step 6), commit and push.
+4. Post the decisions as one comment, the way the review was posted, whose first line is `<!-- sdd-decisions pr=<number> round=<round> review=<review comment ID> commit=<pushed head> -->`, followed by each finding with what was done or why it was rejected.
+5. Report back the commit the checks ran on, the decisions comment's ID, and each rejected finding in one line with its reason. Mark `disputed` a finding you reject again after the re-review re-raised it: the orchestrator decides it.
+
 In local mode, none of the code, commits or PRs mention task slugs, ADRs or the workflow, the branch name aside: skip code references and the slug/links in step 6.

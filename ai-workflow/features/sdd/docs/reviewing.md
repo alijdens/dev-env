@@ -1,6 +1,6 @@
 # Task Workflow: Reviewing a Task's PR
 
-A review checks that a PR delivers its task as planned, and nothing else. It is read-only: report the findings, and don't fix, comment on, approve or merge the PR unless asked. If the PR isn't checked out, fetch its head into a detached temporary worktree (the review exception in the general guidelines), creating no branches or refs in the repo. Probes (a mutant, a build, a run) go in a worktree only the reviewer uses: that detached temporary worktree or, when someone else (the user, a worker) already has the PR checked out, another detached worktree of its head. Never probe in the worker's or the user's checkout, or in a scratch directory other agents may use: a tree mixed from two PRs builds nothing meaningful. Restore each mutant before the next probe, and remove the worktree afterwards with `git worktree remove`, not `rm -rf`.
+A review checks that a PR delivers its task as planned, and nothing else. It is read-only: report the findings, and don't fix, comment on, approve or merge the PR unless asked (an orchestrated run asks for the report as a comment: "In an orchestrated run"). If the PR isn't checked out, fetch its head into a detached temporary worktree (the review exception in the general guidelines), creating no branches or refs in the repo. Probes (a mutant, a build, a run) go in a worktree only the reviewer uses: that detached temporary worktree or, when someone else (the user, a worker) already has the PR checked out, another detached worktree of its head. Never probe in the worker's or the user's checkout, or in a scratch directory other agents may use: a tree mixed from two PRs builds nothing meaningful. Restore each mutant before the next probe, and remove the worktree afterwards with `git worktree remove`, not `rm -rf`.
 
 The project's full check suite is the implementer's job and CI's, not the reviewer's: verify that the commit the checks ran on, given with the review request or named in the PR, is the head under review, and run only the targeted checks the findings need.
 
@@ -136,11 +136,13 @@ Following `../testing.md`, flag tests, new or existing, that can be removed or m
 
 ## Re-reviews
 
-A round after fixes comes with the commit range of the fixes and the findings decided so far. Verify that each accepted finding is fixed, review the changed hunks with the checks above, and re-run `sdd validate`; don't re-review code the round didn't touch, and don't raise what was rejected. When the range holds a merge from main, review the fix commits, not what main brought in. New findings are for regressions and for what the fixes introduced: say for each whether the fixes introduced it or it was there before, so the orchestrator can tell a loop that converges from one that doesn't. The report still ends with the risk level, rated on the PR as it now stands.
+A round after fixes comes with the commit range of the fixes and the earlier findings with what the worker did with each: in an orchestrated run, as the IDs of the earlier review and decisions comments, read with `gh api repos/{owner}/{repo}/issues/comments/<id> --jq .body`. They hold everything the round needs, so the PR's other comments don't need reading. Verify that each finding the worker fixed is fixed, review the changed hunks with the checks above, and re-run `sdd validate`; don't re-review code the round didn't touch. Judge each finding the worker rejected by its reason: drop it when the reason holds, and re-raise it with what the reason misses when it doesn't. One the orchestrator decided isn't raised again. When the range holds a merge from main, review the fix commits, not what main brought in. New findings are for regressions and for what the fixes introduced: say for each whether the fixes introduced it or it was there before, so the orchestrator can tell a loop that converges from one that doesn't. The report still ends with the risk level, rated on the PR as it now stands.
 
 ## Report
 
-List the findings grouped by check, most severe first, each with its file and line, what's wrong and a concrete suggestion. Say explicitly which checks passed, and which couldn't be done (e.g. the task can't be found), instead of leaving them out.
+List the findings grouped by check, most severe first, each with its severity (`low` to `critical`, the scale of the risk level below), its file and line, what's wrong and a concrete suggestion. A `low` one also says whether its fix stays within the lines it names (a test, a doc line, a guard): only then can a last round's lows land without a re-review. Flag a finding `hold` when it changes an accepted decision, breaks a principle or shows a criterion the code can't meet (`orchestrating.md`, "What the orchestrator doesn't decide"), and `other task` when what it asks for belongs to another task. Say explicitly which checks passed, and which couldn't be done (e.g. the task can't be found), instead of leaving them out.
+
+Under **Notes**, apart from the findings, put what the PR can't or needn't act on: observations, and planning findings that only whoever plans next can act on (a task that should have been split, a missing link the worker already added). They aren't fixed and don't count as findings.
 
 End with the PR's risk level (`low`, `medium`, `high` or `critical`) and a one-line reason. It rates how bad it would be if the PR as it stands had a bug that slipped through, so open findings raise it and fixed ones don't count. State its two parts separately, so the same kind of change gets the same level from any reviewer:
 
@@ -148,3 +150,11 @@ End with the PR's risk level (`low`, `medium`, `high` or `critical`) and a one-l
 - The **residual**, your judgement of the PR as it stands: `low` for changes that are small, well tested and easy to revert, `medium` for the rest, higher with open findings.
 
 The level is the higher of the two.
+
+### In an orchestrated run
+
+The report goes on the PR and only a summary goes back, so the findings reach the worker as written and stay out of the orchestrator's context, which every later turn of the run re-reads:
+
+1. Write the report to a file outside the worktree. Its first line is `<!-- sdd-review pr=<number> round=<round> commit=<head reviewed> -->`, with the round the prompt gives: GitHub hides it when rendering, and the worker checks it before fixing anything.
+2. Post it with `gh api repos/{owner}/{repo}/issues/<pr>/comments -F body=@<file> --jq .id` (a PR's comments live under `issues/`), which prints the new comment's ID. With no ID the post failed: say so instead of returning a summary.
+3. Return only the summary: the comment's ID, the risk level with its floor and residual, the number of findings at each severity, how many the fixes introduced (in a re-review), how many lows have a fix that doesn't stay within their lines, and one line for each flagged finding and each note.
