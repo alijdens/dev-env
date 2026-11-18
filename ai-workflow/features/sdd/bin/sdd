@@ -580,6 +580,54 @@ class Project:
         return dest
 
 
+class RevProject(Project):
+    """The tasks and questions of a data root as a commit has them, read from git's objects in two calls instead of
+    from a worktree: `sdd blockers --main` reads nothing else, and the sdd-decisions plugin runs it every minute."""
+
+    def __init__(self, proj, repo, rev):
+        super().__init__(proj.root, proj.mode)
+        rel = os.path.relpath(proj.root, repo)
+        listed = git("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{rel}/tasks", f"{rel}/questions", cwd=repo).stdout
+        paths = sorted(p for p in listed.split("\0") if p.endswith(".md"))
+        r = subprocess.run(["git", "cat-file", "--batch"], cwd=repo, capture_output=True,
+                           input="".join(f"{rev}:{p}\n" for p in paths).encode())
+        if r.returncode != 0:
+            raise Error(f"git cat-file failed:\n{r.stderr.decode().strip()}")
+        self.texts, out, i = {}, r.stdout, 0
+        for p in paths:  # each object is "<sha> blob <size>\n<size bytes>\n"
+            header_end = out.index(b"\n", i)
+            size = int(out[i:header_end].split()[2])
+            self.texts[os.path.join(proj.root, os.path.relpath(p, rel))] = out[header_end + 1:header_end + 1 + size].decode()
+            i = header_end + 2 + size
+
+    def files_under(self, top):
+        """(path, path parts under `top`) of the files read."""
+        for path in self.texts:
+            if path.startswith(top + os.sep):
+                yield path, os.path.relpath(path, top).split(os.sep)
+
+    def meta(self, path):
+        meta = parse_frontmatter(self.texts[path])
+        if meta is None:
+            raise Error(f"{path}: missing frontmatter")
+        return meta
+
+    # Both in task_files() and question_files() order, so a duplicate slug resolves the same way.
+    def tasks(self):
+        files = []
+        for path, parts in self.files_under(self.tasks_dir):
+            if len(parts) == 2 and parts[0] in OPEN_STATES:
+                files.append(((OPEN_STATES.index(parts[0]), "", parts[1]), parts[1][:-3], parts[0], path, None))
+            elif len(parts) == 3 and parts[0] == "done":
+                files.append(((len(OPEN_STATES), parts[1], parts[2]), parts[2][:-3], "done", path, parts[1]))
+        return {slug: Task(state, path, date, self.meta(path)) for _, slug, state, path, date in sorted(files)}
+
+    def questions(self):
+        found = sorted(((QUESTION_STATES.index(parts[0]), parts[1][:-3], parts[0], path) for path, parts in self.files_under(self.questions_dir)
+                        if len(parts) == 2 and parts[0] in QUESTION_STATES))
+        return {slug: Question(state, path, self.meta(path)) for _, slug, state, path in found}
+
+
 class Loaded:
     """The data root read once and the briefs' parts rendered once, for commands that build many briefs."""
 
@@ -2169,8 +2217,8 @@ def on_main(proj, fn):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def cmd_blockers(args):
-    result = blockers(find_project(args.dir))  # `--main` is handled for every read-only command in main()
+def cmd_blockers(args, proj=None):
+    result = blockers(proj or find_project(args.dir))  # `--main` is handled in run_command()
     if args.json:
         print(json.dumps(result))
         return
@@ -2747,6 +2795,11 @@ def run_command(args):
     proj = find_project(args.dir)
     if proj.mode == "local":
         raise Error("local mode: the data isn't shared, there is no main to read")
+    if args.fn is cmd_blockers:
+        repo = toplevel(proj.root)
+        base = default_branch(repo)
+        git("fetch", "-q", REMOTE, base, cwd=repo, check=False)
+        return cmd_blockers(args, RevProject(proj, repo, f"{REMOTE}/{base}"))
 
     def on_main_root(p):
         args.dir = p.root

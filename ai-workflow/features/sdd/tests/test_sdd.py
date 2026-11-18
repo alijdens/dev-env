@@ -1903,6 +1903,26 @@ def test_blockers_main_reads_the_remote_branch_not_the_checkout(shared):
     assert run("blockers", "--main", cwd=shared).stdout.startswith("open: 1\nq\tQ?\ta\t2\t")
 
 
+def test_blockers_main_reads_git_objects_without_a_worktree(shared):
+    import json
+    run("new", "c", "--title", "Café ☕", cwd=shared)  # sizes in the object stream are bytes
+    run("new", "d", "--title", "D", "--after", "c", cwd=shared)
+    (shared / "docs/tasks/done/2026-11-18").mkdir(parents=True)
+    git("mv", "docs/tasks/todo/a.md", "docs/tasks/done/2026-11-18/a.md", cwd=shared)
+    fill_question(Path(run("ask", "q", "--title", "Ünïcode?", "--blocks", "b", "--task", "b", cwd=shared).stdout.strip()))
+    fill_question(Path(run("ask", "r", "--title", "R?", "--blocks", "c", "--task", "c", cwd=shared).stdout.strip()))
+    fill_question(Path(run("ask", "s", "--title", "S?", "--blocks", "d", "--task", "d", cwd=shared).stdout.strip()), answer="Yes.")
+    run("answer", "s", cwd=shared)
+    commit_all(shared, "plan")
+    git("push", "-q", "origin", "main", cwd=shared)
+    # A worktree can't be added now, so `--main` commands that check one out fail, and blockers doesn't need one.
+    (shared / ".git/worktrees").write_text("")
+    assert "worktree" in fails("--main", "ready", cwd=shared)
+    on_main = json.loads(run("blockers", "--main", "--json", cwd=shared).stdout)
+    assert on_main == json.loads(run("blockers", "--json", cwd=shared).stdout)
+    assert [(r["slug"], r["title"], r["blocks"]) for r in on_main["blockers"]] == [("r", "R?", ["c"]), ("q", "Ünïcode?", ["b"])]
+
+
 def test_main_flag_reads_the_remote_branch_for_read_only_commands(shared, repo, tmp_path):
     run("new", "c", "--title", "C", cwd=shared)
     assert "c\ttodo" in run("ready", cwd=shared).stdout
