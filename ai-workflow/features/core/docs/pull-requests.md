@@ -45,7 +45,7 @@ Skip it when the change isn't visible or an image adds nothing (a copy tweak the
 
 Attach a capture to the PR, don't only save it locally:
 
-- **With a CLI that uploads attachments.** The GitHub CLI does with `--attach` (gh 2.99 or newer; not on GitHub Enterprise Server): reference the file in the body and pass it, and the reference is rewritten to the uploaded asset: `![The login error state](./login.png)` in the body, then `gh pr edit 23 --body-file body.md --attach ./login.png` (`gh pr create` takes the same flag). GitHub's body now differs from a local copy kept with `pull-pr-description` (below), so right after the push replace that file with it (`gh pr view 23 --json body --jq .body > <path>`) and re-run `pull-pr-description` (expect `unchanged`); otherwise the next `--body-file` push restores `./login.png` and breaks the image. A non-zero exit may still have updated the PR with the files that did upload: check it before retrying. If the flag is unknown or the host refuses the upload, treat the CLI as one that can't upload; don't upgrade or re-authenticate it.
+- **With a CLI that uploads attachments.** The GitHub CLI does with `--attach` (gh 2.99 or newer; not on GitHub Enterprise Server). Save the capture in the folder of the description's local copy (below), which is the branch's own, reference it from the body by name, `![The login error state](./login.png)`, and push with `pull-pr-description --push <PR id> --attach ./login.png`: the reference is rewritten to the uploaded asset, and the local copy takes GitHub's version, so the next push keeps it. A new PR is opened first and gets its captures with that push. A non-zero exit may still have updated the PR with the files that did upload: run `pull-pr-description <PR id>` and handle its status before retrying. If the flag is unknown or the host refuses the upload, treat the CLI as one that can't upload; don't upgrade or re-authenticate it.
 - **Otherwise, with browser tooling.** Upload the file in the PR page's description editor, copy the URL it inserts into your local body and push that the usual way, without saving the description in the page, which would overwrite edits made since you last synced it. If the upload doesn't go through on the first try (e.g. the file picker can't be driven), stop.
 - **When it can't be attached,** the placeholder names the local file and says why: the error the upload gave, or that the session had neither a CLI that uploads nor browser access. The report says the same.
 
@@ -83,14 +83,15 @@ For a small fix, these can collapse into a short paragraph each, or fewer if the
 
 Skip Tests/Docs sections and test-plan checklists unless a reviewer needs specific guidance about them — the diff already shows the tests.
 
-### Updating an existing description
+### Writing and updating the description
 
-Edit a local copy of the description instead of rewriting it inline, and make sure GitHub's version didn't change in the meantime:
+Write the description in the local copy `pull-pr-description` keeps (on `PATH`), not in a file of your own: the copy is the branch's, so agents working in parallel never share one, and the script refuses to push over changes made on GitHub in the meantime. Pass `-R owner/repo` after the PR id or branch when outside the PR's repo.
 
-1. Run `pull-pr-description <PR id>` (on `PATH`; pass `-R owner/repo` after the id when outside the PR's repo). It syncs the description into a local file, keyed by repo and PR, and prints `path:` and `status:`. Use the printed path in the steps below.
-2. Read the file only when `status` is `new` or `updated`. On `unchanged` your earlier read is still current; on `conflict` GitHub changed while the local file has unpushed edits: read GitHub's version (`gh pr view <PR id> --json body --jq .body`) and merge its changes into the local file, keeping both sides' intent. Ask the user only if the two sides contradict each other.
-3. Edit the file.
-4. Re-run the script right before pushing; on `conflict`, handle it as in step 2 (it keeps reporting `conflict` until the merged file is pushed, so don't re-check after merging). Push with `gh pr edit <PR id> --body-file <path>`.
-5. Re-run the script once more so its baseline matches what was pushed (expect `unchanged`).
+- **A new PR:** `pull-pr-description <branch>` prints `path:` and `status: none` while the branch has no PR. Write the body at that path and open the PR with `gh pr create --body-file <path>`; later runs by PR id find the same file.
+- **An existing PR:**
+  1. Run `pull-pr-description <PR id>`. It syncs the description into the local copy and prints `path:` and `status:`.
+  2. Read the file only when `status` is `new` or `updated`. On `unchanged` your earlier read is still current; on `conflict` GitHub changed while the local file has unpushed edits: read GitHub's version at the printed `remote:` path and merge its changes into the local file, keeping both sides' intent. Ask the user only if the two sides contradict each other.
+  3. Edit the file.
+  4. Push with `pull-pr-description --push <PR id>`. It syncs first and refuses on a conflict, which it keeps reporting until the file is edited (handle it as in step 2), and afterwards the local copy matches GitHub's.
 
 When not specified, default to opening PRs in "draft" rather than ready to review.

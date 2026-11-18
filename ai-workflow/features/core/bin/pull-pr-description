@@ -1,68 +1,160 @@
 #!/usr/bin/env bash
-# Syncs a PR description from GitHub into a local file and reports whether it changed, so callers
-# only re-read the file when needed. Runs in the current repo (or pass `-R owner/repo` after the
-# PR id). The file lives under ${TMPDIR:-/tmp}/prs/<owner>/<repo>/, so PRs with the same number in
-# different repos don't share a copy.
+# Keeps a PR description in a local file: pulls it from GitHub and reports whether it changed, so
+# callers only re-read the file when needed, and pushes it back. The copy lives in a folder per branch,
+# ${TMPDIR:-/tmp}/prs/<owner>/<repo>/<branch>/description.md, rather than per PR number, so the body
+# can be written there before the PR exists, and agents working in parallel on different branches
+# never share a file. The PR's captures go in the same folder.
 #
-# Usage: pull-pr-description <PR id> [gh pr view flags...]
+# Usage: pull-pr-description <PR id | branch> [-R [HOST/]OWNER/REPO]
+#        pull-pr-description --push <PR id | branch> [-R [HOST/]OWNER/REPO] [--attach <file>]...
 #
 # Prints `path: <file>` and `status: <status>`:
-#   new        no local copy existed; it was created
+#   none       the branch has no PR yet; the file (created empty if missing) is the body for
+#              `gh pr create --body-file`, and later runs find the PR on the same file
+#   new        no local copy existed, or only one written before the PR; it now holds GitHub's version
 #   unchanged  nothing to re-read: GitHub matches the last pulled version (local file untouched, may
 #              hold unpushed edits) or matches the local file (e.g. right after pushing it)
 #   updated    GitHub changed since the last pull and the local file had no edits; it was replaced
-#   conflict   GitHub changed and the local file has unpushed edits; nothing was overwritten
+#   conflict   GitHub changed and the local file has unpushed edits; nothing was overwritten or pushed.
+#              Also prints `remote: <file>`, GitHub's version to merge into the local file; it stays a
+#              conflict until the local file is edited
+#   pushed     (--push) the local file was pushed and now holds GitHub's version of it
+#
+# --push refuses on a conflict (exit 1). --attach paths are relative to the file's folder, where
+# captures go: the push runs from there, so a body reference like ./login.png names the attached file.
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <PR id> [gh pr view flags...]" >&2
+usage() {
+  echo "Usage: $0 [--push] <PR id | branch> [-R [HOST/]OWNER/REPO] [--attach <file>]..." >&2
   exit 1
-fi
-
-pr="$1"
-shift
-
-fetched="$(mktemp)"
-raw="$(mktemp)"
-trap 'rm -f "$fetched" "$raw"' EXIT
-# One call for both: the first line is the url, the rest the body.
-gh pr view "$pr" "$@" --json body,url --template '{{.url}}{{"\n"}}{{.body}}' > "$raw"
-# https://<host>/<owner>/<repo>/pull/<n>, on github.com and GHES alike.
-repo_path="$(head -n1 "$raw" | sed -nE 's#^https?://[^/]*/([^/]*)/([^/]*)/pull/.*#\1/\2#p')"
-if [[ -z "$repo_path" ]]; then
-  echo "could not tell the repo from the PR url: $(head -n1 "$raw")" >&2
-  exit 1
-fi
-tail -n +2 "$raw" > "$fetched"
-
-dir="${TMPDIR:-/tmp}/prs/$repo_path"
-file="$dir/$pr.description.md"
-base="$dir/$pr.description.remote.md" # last version seen on GitHub, to tell local edits from remote changes
-mkdir -p "$dir"
-
-# GitHub may store CRLF and editors add a final newline, so bytes differ after every push although
-# nothing changed: compare with line endings, trailing whitespace and trailing blank lines normalised.
-same() {
-  cmp -s <(sed 's/\r$//; s/[[:space:]]*$//' "$1" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}') \
-         <(sed 's/\r$//; s/[[:space:]]*$//' "$2" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
 }
 
-if [[ ! -f "$file" || ! -f "$base" ]]; then
+push=false
+if [[ "${1:-}" == --push ]]; then
+  push=true
+  shift
+fi
+[[ $# -ge 1 && "$1" != -* ]] || usage
+pr="$1"
+shift
+repo_flag=()
+attach=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -R | --repo)
+      [[ $# -ge 2 ]] || usage
+      repo_flag=(-R "$2")
+      shift 2
+      ;;
+    --attach)
+      $push && [[ $# -ge 2 ]] || usage
+      attach+=(--attach "$2")
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# Sets url and branch and writes GitHub's body to $tmp/fetched; returns 1 when the branch has no PR.
+fetch() {
+  if ! gh pr view "$pr" "${repo_flag[@]}" --json url,headRefName,body \
+    --template '{{.url}}{{"\n"}}{{.headRefName}}{{"\n"}}{{.body}}' > "$tmp/raw" 2> "$tmp/err"; then
+    grep -q "no pull requests found" "$tmp/err" && return 1
+    cat "$tmp/err" >&2
+    exit 1
+  fi
+  url="$(sed -n 1p "$tmp/raw")"
+  branch="$(sed -n 2p "$tmp/raw")"
+  tail -n +3 "$tmp/raw" > "$tmp/fetched"
+}
+
+# Sets file and base from a repo or PR url (https://<host>/<owner>/<repo>[/pull/<n>], on github.com
+# and GHES alike) and a branch.
+locate() {
+  local repo_path
+  repo_path="$(sed -nE 's#^https?://[^/]*/([^/]*/[^/]*).*#\1#p' <<< "$1")"
+  if [[ -z "$repo_path" ]]; then
+    echo "could not tell the repo from the url: $1" >&2
+    exit 1
+  fi
+  local dir="${TMPDIR:-/tmp}/prs/$repo_path/$2"
+  file="$dir/description.md"
+  base="$dir/description.remote.md" # last version seen on GitHub, to tell local edits from remote changes
+  mark="$dir/description.conflict.md" # the local file when a conflict was found, until it's edited
+  mkdir -p "$dir"
+}
+
+# GitHub may store CRLF and editors add a final newline, so bytes differ after every push although
+# nothing changed: compare with line endings, trailing whitespace, the final newline and trailing
+# blank lines normalised.
+normalised() {
+  sed 's/\r$//; s/[[:space:]]*$//; $a\' "$1" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+}
+same() {
+  cmp -s <(normalised "$1") <(normalised "$2")
+}
+
+report() {
+  echo "path: $file"
+  echo "status: $1"
+  if [[ $1 == conflict ]]; then echo "remote: $base"; fi
+}
+
+if ! fetch; then
+  if $push || [[ "$pr" =~ ^[0-9]+$ ]]; then
+    echo "no pull request found for $pr" >&2
+    exit 1
+  fi
+  locate "$(gh repo view "${repo_flag[@]:1}" --json url --jq .url)" "$pr"
+  [[ -f "$file" ]] || : > "$file"
+  report none
+  exit 0
+fi
+locate "$url" "$branch"
+
+# An edit since the conflict was found is taken as the merge.
+if [[ -f "$mark" ]] && ! same "$file" "$mark"; then rm "$mark"; fi
+
+if [[ -f "$file" ]] && same "$tmp/fetched" "$file"; then
+  status=unchanged
+  cp "$tmp/fetched" "$base"
+elif [[ ! -f "$file" || ! -f "$base" ]]; then
+  # A file without a base was written before the PR existed, and the PR was created from it: GitHub's
+  # version is that body as stored, with any attachment references rewritten.
   status=new
-  cp "$fetched" "$file"
-  cp "$fetched" "$base"
-elif same "$fetched" "$file"; then
+  cp "$tmp/fetched" "$file"
+  cp "$tmp/fetched" "$base"
+  rm -f "$mark"
+elif same "$tmp/fetched" "$base"; then
   status=unchanged
-  cp "$fetched" "$base"
-elif same "$fetched" "$base"; then
-  status=unchanged
+  if [[ -f "$mark" ]]; then status=conflict; fi
 elif same "$file" "$base"; then
   status=updated
-  cp "$fetched" "$file"
-  cp "$fetched" "$base"
+  cp "$tmp/fetched" "$file"
+  cp "$tmp/fetched" "$base"
 else
+  # GitHub's version becomes the base, so the file pushes once its changes are merged in, and stays
+  # a conflict until the file is edited.
   status=conflict
+  cp "$tmp/fetched" "$base"
+  cp "$file" "$mark"
 fi
 
-echo "path: $file"
-echo "status: $status"
+if $push; then
+  if [[ $status == conflict ]]; then
+    report conflict
+    exit 1
+  fi
+  if ! same "$file" "$tmp/fetched" || [[ ${#attach[@]} -gt 0 ]]; then
+    (cd "$(dirname "$file")" && gh pr edit "$url" --body-file "$file" "${attach[@]}" > /dev/null)
+    # gh rewrote the attachment references: keep its version, or the next push would undo them.
+    fetch
+    cp "$tmp/fetched" "$file"
+    cp "$tmp/fetched" "$base"
+    status=pushed
+  fi
+fi
+report "$status"
