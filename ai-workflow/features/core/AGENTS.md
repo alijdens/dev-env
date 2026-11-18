@@ -29,11 +29,19 @@ If a task can't be fulfilled because something looks like an error, stop — don
 
 - Run commands with stdin closed (`</dev/null`) and never start something that waits for input: a sub-agent that blocks on a prompt stalls silently.
 - Chain dependent steps with `&&` and read the exit code yourself; don't take a notification or a log tail for a result. Keep a log until the step that needed it has succeeded.
-- Scratch work (a probe, a copy of a repo, a build) goes in a fresh `mktemp -d` with caches of its own, removed when done. Never remove or rebuild caches, containers or volumes that other sessions on the machine may share.
+- Scratch work (a probe, a copy of a repo, a build) goes in a fresh `mktemp -d` with caches of its own, removed when done, unless the probe runs in place as `{{AI_WORKFLOW_DOCS_DIR}}/testing.md` says. Never remove or rebuild caches, containers or volumes that other sessions on the machine may share.
 - Secrets: read one from an environment variable, never print or paste it, and check the diff for it before committing.
 - To find out whether a secret exists, use the `secrets` CLI, never `echo`/`printenv`/`env`/`cat`/`grep` or a one-liner of your own, which put the value in your context: `secrets has NAME` (checks the current env and the env files of the current directory, and says where it is set), `secrets list` (names only, grouped by source); `--env` and `--file PATH` narrow either to the sources you name. For anything else, e.g. handing a value to another command, read `secrets --help` first.
 - When stating what a file, doc or API says, point at where (file and line, section); mark anything recalled from memory as such.
 - Do what was asked or say it can't be done. Don't quietly park an unmet requirement in a note, a TODO or a question and report the work as finished.
+
+## Claude Code
+
+Only for Claude Code and its sub-agents; other tools skip this section.
+
+- Change files with `Edit` and `Write`, not with a script, a heredoc or `sed -i` run through `Bash`. The script's whole body stays in context for every later turn, and work whose changes bypassed the edit tools has been rejected as having edited nothing and had to be redone.
+- Read the part of a file you need with `Read` (`offset`, `limit`) instead of printing the whole file through `Bash`, and one file per `Read`, never `cat a b`: a `Bash` result over 30,000 characters is cut off and saved to a file that then gets read again, so its start lands in context twice. Don't read again what is already in context: every later turn of the session pays for it again.
+- Run a long command (a full check suite, evals) in the foreground with a `timeout` of up to 600000 ms and its output in a log, not with `run_in_background` and `Monitor`: a sub-agent that ends its turn waiting on background work wakes the agent that started it, which re-reads its whole context only to wait. Only a command that can take longer than 10 minutes goes to the background.
 
 ## Commits and pull requests
 

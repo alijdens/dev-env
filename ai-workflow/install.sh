@@ -38,6 +38,7 @@ TOOLS=(
   "claude:$INSTALL_HOME/.claude:CLAUDE.md"
   "codex:$INSTALL_HOME/.codex:AGENTS.md"
   "agents:$INSTALL_HOME/.agents:AGENTS.md"
+  "agy:$INSTALL_HOME/.gemini:AGENTS.md"
 )
 
 available_features() {

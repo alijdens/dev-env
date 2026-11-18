@@ -22,7 +22,7 @@ A `parse_date` lib function used by a `ReportService`, exposed through a `/repor
 
 ## Prove a test can fail
 
-A test only counts as covering a guard, a bound or a branch if it fails when that code is taken out. Before claiming coverage for one (in a PR description, a review or a report), check it: remove or invert the guarded line in a scratch copy and run the test; if it still passes, the test asserts something else. A probe that hangs instead of failing (a removed loop bound, a removed timeout) is not a kill either: the test needs its own bound so a broken guard fails fast. Don't claim coverage you didn't check this way.
+A test only counts as covering a guard, a bound or a branch if it fails when that code is taken out. Before claiming coverage for one (in a PR description, a review or a report), check it: remove or invert the guarded line and run the test; if it still passes, the test asserts something else. Run the probe in place when the working copy is one nobody else is using: commit the work first so the mutation is the only uncommitted change, mutate the line, run the test, restore it with `git checkout -- <file>` and confirm `git status` is clean before going on. Don't use `git stash`: its stack is shared by every worktree of the repository, so with concurrent agents one can pop another's. When the working copy is shared or has uncommitted work, probe in a scratch copy instead. A probe that hangs instead of failing (a removed loop bound, a removed timeout) is not a kill either: the test needs its own bound so a broken guard fails fast. Don't claim coverage you didn't check this way.
 
 ## Don't wait on real time
 
