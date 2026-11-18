@@ -52,6 +52,34 @@ def sections(out):
     return result
 
 
+class TestHelp:
+    # What an agent reading `secrets --help` has no use for: it only needs to know how to call the tool.
+    INTERNALS = ["minLength", "excludeNames", "urlPasswords", "SECRETS_CONFIG", "SECRETS_REDACT_FILES", "XDG_CONFIG_HOME", "PEM", "REDACTED", "redact.", "secrets redact", "1 MiB", "10,000", "git root", "Configuration", "50 files", "placeholders", "--help-all"]
+
+    def test_the_help_is_only_how_to_call_the_tool(self, run):
+        r = run("--help")
+        assert r.returncode == 0
+        for word in self.INTERNALS:
+            assert word not in r.stdout, word
+        assert len(r.stdout.splitlines()) < 40 and len(r.stdout) < 2500
+        for command in ("has", "list", "get"):
+            assert f"secrets {command}" in r.stdout
+
+    def test_redact_says_what_it_does_without_listing_what_it_redacts(self, run):
+        r = run("redact", "--help")
+        assert r.returncode == 0
+        assert "Reads text on stdin and writes it with secret values replaced by [REDACTED:NAME]." in " ".join(r.stdout.split())
+        assert len(r.stdout.splitlines()) < 10
+        for word in ("minLength", "excludeNames", "urlPasswords", "SECRETS_CONFIG", "SECRETS_REDACT_FILES", "PEM", "redact.", "1 MiB", "10,000", "git root", "Configuration", "KEY", "TOKEN", "PASSWORD"):
+            assert word not in r.stdout, word
+
+    def test_the_help_of_a_command_is_short_too(self, run):
+        for command in ("has", "list", "get"):
+            r = run(command, "--help")
+            assert r.returncode == 0 and len(r.stdout.splitlines()) < 15
+            assert "--file" in r.stdout
+
+
 class TestHas:
     def test_lists_the_places_it_is_set_and_only_those(self, run, tmp_path):
         write(tmp_path, ".env", "A=1\nB=1\n")
