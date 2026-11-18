@@ -15,7 +15,7 @@ In local mode the data isn't shared, so there's nothing to sync.
 
 ## Pick what to plan
 
-When the user names no feature, don't assume one: ask whether to plan something new or pick up a recorded idea (`overview.md`, "Ideas"). For an idea, list `sdd ideas --ready` grouped by area, a line each, and say in one line how many more wait on unfinished tasks (`sdd ideas`); one of those is planned only if the user insists, after saying what it waits on. The picked idea's Idea and Context are the feature description, and its areas, tasks and ADRs seed the search below.
+When the user names no feature, don't assume one: ask whether to plan something new or pick up a recorded idea (`managing.md`, "Ideas"). For an idea, list `sdd ideas --ready` grouped by area, a line each, and say in one line how many more wait on unfinished tasks (`sdd ideas`); one of those is planned only if the user insists, after saying what it waits on. The picked idea's Idea and Context are the feature description, and its areas, tasks and ADRs seed the search below.
 
 ## Understand, then load context
 
@@ -78,7 +78,7 @@ A record is read by someone deciding a case nobody planned, so it says what is w
 
 ## Changing a record
 
-An accepted record changes only with the user's agreement (`overview.md`). When a case doesn't fit one, or a plan needs it to say something else:
+An accepted record changes only with the user's agreement (`managing.md`, "How records change"). When a case doesn't fit one, or a plan needs it to say something else:
 
 1. Read its Intent, or the rule's Why. If that answers the case, follow it; nothing is written.
 2. If the intent wants what the wording forbids, the wording is at the wrong level. Restate the record in place so the case is no longer special, and show the user the old statement next to the new one.

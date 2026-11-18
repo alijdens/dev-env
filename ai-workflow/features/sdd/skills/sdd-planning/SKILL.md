@@ -21,7 +21,7 @@ If the user named no feature, don't assume one: ask whether to plan something ne
 
 Read and follow, in order:
 
-1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md): the `sdd` CLI, modes and layout.
+1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md) and [managing.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/managing.md): the `sdd` CLI, modes and layout, and how the data changes.
 2. The project's `goal.md` and `principles.md` at the data root, when they exist (`sdd doc list`): the feature is designed to serve the goal within the principles, never in isolation. If a doc is missing or a draft, say so once and continue; writing it is the `sdd-setup-task-workflow` skill.
 3. [planning.md]({{AI_WORKFLOW_DOCS_DIR}}/planning.md): how to shape the design.
 4. [sdd/planning.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/planning.md): understanding the feature and loading the decisions and work it builds on (`sdd context`), proposing its shape, rules and tasks, then writing the agreed plan as a feature spec, ADRs, business rules, tasks and dependencies.

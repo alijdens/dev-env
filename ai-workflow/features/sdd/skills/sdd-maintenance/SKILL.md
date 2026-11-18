@@ -9,7 +9,7 @@ description: >-
 
 Read and follow, in order:
 
-1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md): the `sdd` CLI, modes and layout.
+1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md) and [managing.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/managing.md): the `sdd` CLI, modes and layout, and how the data changes.
 2. [maintenance.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/maintenance.md): the items, their order and how to do each.
 3. For stale questions only, [answering.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/answering.md), "Stale questions" and its Ship step.
 

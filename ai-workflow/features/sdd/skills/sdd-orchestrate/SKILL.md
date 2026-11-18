@@ -17,7 +17,7 @@ Invoking this skill is the user's explicit authorization, under the general "nev
 
 Read and follow, in order:
 
-1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md): the `sdd` CLI, modes and layout.
+1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md) and [managing.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/managing.md): the `sdd` CLI, modes and layout, and how the data changes.
 2. [orchestrating.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/orchestrating.md): the inputs, loop and report.
 
 Workers and reviewers load their own docs through their skills; don't load `working.md`, `reviewing.md` or the planning docs.

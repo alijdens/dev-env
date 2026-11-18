@@ -9,7 +9,7 @@ description: >-
 
 Read and follow, in order:
 
-1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md): the `sdd` CLI, modes and layout.
+1. [overview.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/overview.md) and [managing.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/managing.md): the `sdd` CLI, modes and layout, and how the data changes.
 2. [answering.md]({{AI_WORKFLOW_DOCS_DIR}}/sdd/answering.md): the order, the one-question-at-a-time flow, and what to do with each answer.
 
 Don't load the planning, working or reviewing docs. If `sdd root` fails, the project doesn't use the task workflow: say so and stop.
