@@ -219,6 +219,9 @@ def test_brief_prints_the_task_and_everything_linked_to_it(repo):
                    .replace("## Context\n", "## Context\n\nSessions outgrew memory.\n") + "## Review checks\n\n- Every key has a TTL.\n")
     run("new", "a", "--title", "A", "--arch", adr.stem, cwd=repo)
     run("new", "b", "--title", "B", "--after", "a", cwd=repo)
+    dependent = repo / "docs/tasks/todo/b.md"
+    dependent.write_text(dependent.read_text().replace("## Acceptance criteria\n", "## Acceptance criteria\n\n- Calls a's export.\n")
+                         .replace("## Notes\n", "## Notes\n\nPlans to cache it.\n"))
     fill_question(Path(run("ask", "ttl", "--title", "How long?", "--task", "a", cwd=repo).stdout.strip()))
     fill_doc(Path(run("doc", "new", "goal", cwd=repo).stdout.strip()))
 
@@ -232,13 +235,15 @@ def test_brief_prints_the_task_and_everything_linked_to_it(repo):
     assert f"=== {adr_title}\n\n" in out and "Keep it in Redis." in out and "Sessions outgrew memory." not in out
     assert "Sessions survive a restart." in out
     assert "=== question (open): questions/open/ttl.md" in out and "=== task: tasks/todo/a.md" in out
-    assert "tasks/todo/b.md" not in out and "=== goal" not in out
+    assert "=== dependent task: tasks/todo/b.md (without Notes: --full)" in out and "Calls a's export." in out
+    assert "Plans to cache it." not in out and "=== goal" not in out
     assert out.count("Every key has a TTL.") == 1
     assert out.rstrip().endswith("=== review checks (sdd checks --task)\n\n" + f"{adr.stem}\t\tStore\n  - Every key has a TTL.")
-    assert "Sessions outgrew memory." in run("brief", "a", "--full", cwd=repo).stdout
+    full = run("brief", "a", "--full", cwd=repo).stdout
+    assert "Sessions outgrew memory." in full and "Plans to cache it." in full
 
     review = run("brief", "a", "--review", cwd=repo).stdout
-    assert "=== dependent task: tasks/todo/b.md" in review and "=== goal: goal.md" in review
+    assert "=== dependent task: tasks/todo/b.md (without Notes: --full)" in review and "=== goal: goal.md" in review
     assert review.rstrip().endswith("  - Every key has a TTL.")
     assert "unknown task" in fails("brief", "zzz", cwd=repo)
 

@@ -59,3 +59,10 @@ Thirteen PRs with three tasks in flight, in a project with no CI whose checks ha
 
 - **Fix rounds resumed the worker that built the PR.** The instructions allowed a new worker but named the resumed one first. By the first review that worker's session held everything it had read to build the PR, and every turn of a fix re-read it, a one-line doc fix included. Changed: a fix round is a new worker, started once the previous one has reported.
 - **Every merge sent every other open PR back to its worker.** With three PRs open and the project's rule that checks pass on the merged result, each merge to main made the other workers merge main and run the checks again, several times per PR, and main moved again while they did. Not changed here: with CI the checks run on the PR by themselves and a merge only concerns the PRs it conflicts with, which is all `orchestrating.md` covers. A project without CI says in its own instructions when main is brought in and who runs the checks.
+
+## 2026-11-18: an orchestrated run where no PR passed its first review
+
+Twenty PRs, none approved in round 1. In seven, the first review's findings were what the reviewer read and the worker didn't:
+
+- **Area checks only the reviewer ran.** Workers got the checks of what their task linked; reviewers added those of the areas the diff touched. Two PRs changed what the assistant shows without linking the rule that requires real-model evals for it, and one ran a migration without the deploy ADR's timing check. Each cost a fix round, and two of them a re-review too. Changed: the worker runs `sdd checks --area` on its diff before its checks, links what was missing and says so; the reviewer still picks the areas itself and reports the missing link as a planning finding.
+- **Dependents only the reviewer read.** Only the review brief carried the dependent tasks, whole, so three PRs were flagged on what their dependents would need, and most review briefs were too long to print. Changed: both briefs carry each dependent's Goal and criteria, without its Notes, and the worker is told to leave room for them, not to build them.

@@ -65,6 +65,8 @@ AMENDMENTS_MAX = 1
 ADR_FULL_ONLY = ("Context", "Alternatives considered", "Consequences")
 # Likewise for an answered question: the Question and Context were for whoever answered it.
 ANSWERED_FULL_ONLY = ("Question", "Context")
+# And for a dependent task: what it will need from this one is in its Goal and criteria, how it plans to build them isn't.
+DEPENDENT_FULL_ONLY = ("Notes",)
 # Inline markdown links; a target with a scheme, an anchor or an absolute path isn't a file next to the record.
 LINK_RE = re.compile(r"(\]\()([^)\s]+)")
 # What closes an inline link after its target: `)`, optionally after a title.
@@ -1956,9 +1958,10 @@ def brief_parts(data, slug, review=False, full=False):
                       ("spec", x) if x in specs else None))
     files += [(f"question ({q.state})", q.path, ANSWERED_FULL_ONLY if q.state == "answered" else (), None, None)
               for _, q in linked_questions(questions, slug)]
+    # The worker reads them too, so that what it builds leaves room for them before the reviewer checks it does.
+    files += [("dependent task", tasks[d].path, DEPENDENT_FULL_ONLY, None, None) for d in data.graph.dependents(slug)]
     if review:
         files += [(name, doc_path(proj, name), (), None, None) for name in PROJECT_DOCS if os.path.isfile(doc_path(proj, name))]
-        files += [("dependent task", tasks[d].path, (), None, None) for d in data.graph.dependents(slug)]
     for kind, path, form, pointer, doc in files:
         if not os.path.isabs(path):
             parts.append((f"{kind}: {path} (missing)", "", 0, None))
